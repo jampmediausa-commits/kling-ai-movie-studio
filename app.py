@@ -86,6 +86,26 @@ def api(method, path, payload=None):
     return result.get('data')
 
 
+def video_download_control(url, key, filename):
+    """Fetch only on explicit click; avoid repeated large downloads on reruns."""
+    if st.button('⬇️ Prepare MP4 download', key=f'prepare_{key}'):
+        try:
+            with st.spinner('Fetching video from Kling...'):
+                response = requests.get(url, timeout=120)
+                response.raise_for_status()
+                if len(response.content) > 250 * 1024 * 1024:
+                    st.warning('Video exceeds the 250 MB in-app download limit. Use Open / save video instead.')
+                else:
+                    st.session_state[f'video_bytes_{key}'] = response.content
+        except requests.RequestException as exc:
+            st.error(f'Could not fetch video: {exc}. Try Open / save video.')
+    data = st.session_state.get(f'video_bytes_{key}')
+    if data:
+        st.download_button('💾 Download MP4 to iPhone', data=data,
+                           file_name=filename, mime='video/mp4',
+                           key=f'download_{key}')
+
+
 def submit(shot, p):
     if shot['task_id'] and shot['status'] in ('submitted', 'processing', 'succeeded'):
         raise RuntimeError('This shot already has a task. Use Retry only if you want a new paid generation.')
@@ -271,7 +291,8 @@ with generate_tab:
         st.error(shot['error'])
     if shot['video_url']:
         st.video(shot['video_url'])
-        st.link_button('⬇️ Open/download video', shot['video_url'])
+        st.link_button('Open / save video', shot['video_url'])
+        video_download_control(shot['video_url'], f'shot_preview_{shot["id"]}', f'shot_{shot["id"]:03d}.mp4')
 
     st.divider()
     st.subheader('Generate & review')
@@ -377,7 +398,8 @@ with generate_tab:
     for s in completed:
         with st.expander(f"{s['title']} {'✓ Approved' if s['approved'] else '• Awaiting approval'}"):
             st.video(s['video_url'])
-            st.link_button('Open video / download', s['video_url'])
+            st.link_button('Open video / save', s['video_url'])
+            video_download_control(s['video_url'], f'gallery_{s["id"]}', f'shot_{s["id"]:03d}.mp4')
 
     st.caption('Kling video URLs may expire (often within 30 days). Download completed clips promptly. This app cannot guarantee persistent storage or automatic video downloads.')
 
@@ -426,6 +448,7 @@ with recover_tab:
                         url = str(output['url'])
                         st.video(url)
                         st.link_button(f'Open / save video {n}', url)
+                        video_download_control(url, f'recovered_{task_id}_{n}', f'kling_{task_id}_{n}.mp4')
                 elif status == 'succeeded':
                     st.warning('Task succeeded but no downloadable video URL was returned.')
                 else:
