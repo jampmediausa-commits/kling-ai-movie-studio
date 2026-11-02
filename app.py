@@ -178,7 +178,7 @@ if password and not st.session_state.get('unlocked', False):
 
 p = get_project()
 st.title('🎬 Kling AI Movie Studio')
-st.caption('Kling 4.0 • Storyboards • Review & Approve • Batch generation')
+st.caption('Kling 4.0 • Generate new shots or recover previous videos')
 if not secret('KLING_API_KEY'):
     st.error('Kling API key not configured. Add KLING_API_KEY in Streamlit Secrets.')
 
@@ -206,223 +206,228 @@ with st.sidebar:
         st.session_state.unlocked = False
         st.rerun()
 
-st.divider()
-st.subheader('📼 Recover previous Kling videos')
-st.caption('Read-only recovery from Kling API task history (last 30 days). This does NOT generate new videos or spend generation credits.')
-if 'recovered_tasks' not in st.session_state:
-    st.session_state.recovered_tasks = []
-if st.button('🔎 Find previous video tasks (no generation charge)'):
-    try:
-        collected = []
-        cursor = ''
-        seen = set()
-        for page in range(10):
-            query = {'limit': 100, 'filters': [{'key': 'product_type', 'values': ['video']}], 'cursor': cursor}
-            data = api('POST', '/tasks', query)
-            if not isinstance(data, dict):
-                raise RuntimeError('Unexpected task-history response from Kling')
-            results = data.get('result') or []
-            for item in results:
-                if isinstance(item, dict) and str(item.get('id', '')) not in seen:
-                    collected.append(item)
-                    seen.add(str(item.get('id', '')))
-            new_cursor = str(data.get('next_cursor') or '')
-            if not data.get('has_more') or not new_cursor or new_cursor == cursor:
-                break
-            cursor = new_cursor
-        st.session_state.recovered_tasks = collected
-        st.success(f'Found {len(collected)} recent video task(s). This includes unfinished or failed tasks.')
-    except Exception as exc:
-        st.error(f'Could not retrieve task history: {exc}')
-recovered = st.session_state.recovered_tasks
-if recovered:
-    st.caption('Download successful videos promptly; Kling says generated results are cleared after 30 days. These are separate from your current storyboard.')
-    for item in recovered:
-        task_id = str(item.get('id', 'unknown'))
-        status = str(item.get('status', 'unknown')).lower()
-        with st.expander(f'Task {task_id} — {status}', expanded=(status == 'succeeded')):
-            st.code(task_id)
-            if item.get('message'):
-                st.caption(str(item['message']))
-            videos = [o for o in (item.get('outputs') or []) if isinstance(o, dict) and o.get('type') == 'video' and o.get('url')]
-            if videos:
-                for n, output in enumerate(videos, 1):
-                    url = str(output['url'])
-                    st.video(url)
-                    st.link_button(f'Open / save video {n}', url)
-            elif status == 'succeeded':
-                st.warning('Task succeeded but no downloadable video URL was returned.')
-            else:
-                st.info('No completed video available for this task yet.')
+generate_tab, recover_tab = st.tabs(['🎬 Generate', '📼 Recover'])
 
-st.subheader('Reference image library')
-st.caption('Images uploaded here are FIRST FRAMES for shots, not a persistent character identity model. Create a full scene image for each shot for best consistency.')
-images_upload = st.file_uploader('Add scene/reference images', type=['png', 'jpg', 'jpeg', 'webp'], accept_multiple_files=True)
-if images_upload and st.button('Add uploaded images to library'):
-    added = 0
-    for file in images_upload:
-        raw = file.getvalue()
-        if len(raw) > 30 * 1024 * 1024:
-            st.warning(f'{file.name}: exceeds 30 MB, skipped')
-            continue
-        mime = file.type or 'image/png'
-        p['images'][file.name] = 'data:' + mime + ';base64,' + base64.b64encode(raw).decode('ascii')
-        added += 1
-    st.success(f'{added} image(s) added')
-if p['images']:
-    st.caption('Available: ' + ', '.join(p['images'].keys()))
+with generate_tab:
+    st.subheader('Reference image library')
+    st.caption('Images uploaded here are FIRST FRAMES for shots, not a persistent character identity model. Create a full scene image for each shot for best consistency.')
+    images_upload = st.file_uploader('Add scene/reference images', type=['png', 'jpg', 'jpeg', 'webp'], accept_multiple_files=True)
+    if images_upload and st.button('Add uploaded images to library'):
+        added = 0
+        for file in images_upload:
+            raw = file.getvalue()
+            if len(raw) > 30 * 1024 * 1024:
+                st.warning(f'{file.name}: exceeds 30 MB, skipped')
+                continue
+            mime = file.type or 'image/png'
+            p['images'][file.name] = 'data:' + mime + ';base64,' + base64.b64encode(raw).decode('ascii')
+            added += 1
+        st.success(f'{added} image(s) added')
+    if p['images']:
+        st.caption('Available: ' + ', '.join(p['images'].keys()))
 
-st.divider()
-st.subheader('Storyboard')
-cols = st.columns([1, 1, 2])
-if cols[0].button('➕ Add shot', use_container_width=True):
-    p['shots'].append(blank_shot(len(p['shots']) + 1))
-    st.session_state.selected = len(p['shots']) - 1
-    st.rerun()
-if cols[1].button('➕ Add 10 shots', use_container_width=True):
-    for _ in range(10):
+    st.divider()
+    st.subheader('Storyboard')
+    cols = st.columns([1, 1, 2])
+    if cols[0].button('➕ Add shot', use_container_width=True):
         p['shots'].append(blank_shot(len(p['shots']) + 1))
-    st.rerun()
-counts = {s: sum(x['status'] == s for x in p['shots']) for s in ['draft', 'submitted', 'processing', 'succeeded', 'failed']}
-cols[2].caption(f"{len(p['shots'])} total • {sum(x['approved'] for x in p['shots'])} approved • {counts['succeeded']} succeeded")
-
-options = [f"{i+1:03d} | {s['title']} | {s['status']}{' ✓' if s['approved'] else ''}" for i, s in enumerate(p['shots'])]
-selected = min(st.session_state.get('selected', 0), len(p['shots']) - 1)
-selection = st.selectbox('Choose shot to edit or review', range(len(options)),
-                         index=selected, format_func=lambda i: options[i])
-st.session_state.selected = selection
-shot = p['shots'][selection]
-shot['title'] = st.text_input('Shot title', value=shot['title'], key=f'title_{selection}')
-shot['prompt'] = st.text_area('Video prompt', value=shot['prompt'], height=140, key=f'prompt_{selection}')
-a, b, c = st.columns(3)
-shot['duration'] = a.selectbox('Duration (seconds)', list(range(3, 31)),
-                               index=max(0, min(27, int(shot['duration']) - 3)), key=f'dur_{selection}')
-shot['resolution'] = b.selectbox('Resolution', ['720p', '1080p'],
-                                 index=0 if shot['resolution'] == '720p' else 1, key=f'res_{selection}')
-ratios = ['16:9', '9:16', '1:1', '21:9', 'adaptive']
-shot['aspect_ratio'] = c.selectbox('Aspect ratio', ratios,
-                                   index=ratios.index(shot['aspect_ratio']) if shot['aspect_ratio'] in ratios else 0,
-                                   key=f'ratio_{selection}')
-image_choices = [''] + list(p['images'].keys())
-shot['image_name'] = st.selectbox('First-frame image (optional)', image_choices,
-                                  index=image_choices.index(shot['image_name']) if shot['image_name'] in image_choices else 0,
-                                  format_func=lambda x: x or 'No image — text to video', key=f'img_{selection}')
-if shot['image_name']:
-    st.image(p['images'][shot['image_name']], width=280)
-
-st.write(f"**Status:** {shot['status']}" + (' • Approved ✓' if shot['approved'] else ''))
-if shot['task_id']:
-    st.caption('Task ID: ' + shot['task_id'])
-if shot['error']:
-    st.error(shot['error'])
-if shot['video_url']:
-    st.video(shot['video_url'])
-    st.link_button('⬇️ Open/download video', shot['video_url'])
-
-st.divider()
-st.subheader('Generate & review')
-st.warning('Video generation is a paid API request. Costs vary by model/settings. Estimates below are planning figures, not a guarantee of Kling billing. Check Kling pricing before large batches.')
-ready = [s for s in p['shots'] if s['status'] == 'draft' and s['prompt'].strip()]
-st.write(f'**Ready drafts:** {len(ready)} | **Total draft duration:** {sum(s["duration"] for s in ready)} seconds')
-st.caption('At an illustrative rate of 1 unit/second, those drafts would use ' + str(sum(s['duration'] for s in ready)) + ' units. Higher resolutions or other settings may cost more.')
-
-if st.button('🔄 Check all task statuses', use_container_width=True):
-    try:
-        updated = check_tasks(p)
-        st.success(f'Checked {updated} task(s)')
-        if p['mode'] == 'Batch' and p['batch_active']:
-            submitted = batch_fill(p)
-            if submitted:
-                st.info(f'Submitted {submitted} more shot(s)')
+        st.session_state.selected = len(p['shots']) - 1
         st.rerun()
-    except Exception as exc:
-        st.error(str(exc))
+    if cols[1].button('➕ Add 10 shots', use_container_width=True):
+        for _ in range(10):
+            p['shots'].append(blank_shot(len(p['shots']) + 1))
+        st.rerun()
+    counts = {s: sum(x['status'] == s for x in p['shots']) for s in ['draft', 'submitted', 'processing', 'succeeded', 'failed']}
+    cols[2].caption(f"{len(p['shots'])} total • {sum(x['approved'] for x in p['shots'])} approved • {counts['succeeded']} succeeded")
 
-if p['mode'] == 'Review & Approve':
-    current = next_review_shot(p)
-    if current is None:
-        st.success('All shots approved!')
+    options = [f"{i+1:03d} | {s['title']} | {s['status']}{' ✓' if s['approved'] else ''}" for i, s in enumerate(p['shots'])]
+    selected = min(st.session_state.get('selected', 0), len(p['shots']) - 1)
+    selection = st.selectbox('Choose shot to edit or review', range(len(options)),
+                             index=selected, format_func=lambda i: options[i])
+    st.session_state.selected = selection
+    shot = p['shots'][selection]
+    shot['title'] = st.text_input('Shot title', value=shot['title'], key=f'title_{selection}')
+    shot['prompt'] = st.text_area('Video prompt', value=shot['prompt'], height=140, key=f'prompt_{selection}')
+    a, b, c = st.columns(3)
+    shot['duration'] = a.selectbox('Duration (seconds)', list(range(3, 31)),
+                                   index=max(0, min(27, int(shot['duration']) - 3)), key=f'dur_{selection}')
+    shot['resolution'] = b.selectbox('Resolution', ['720p', '1080p'],
+                                     index=0 if shot['resolution'] == '720p' else 1, key=f'res_{selection}')
+    ratios = ['16:9', '9:16', '1:1', '21:9', 'adaptive']
+    shot['aspect_ratio'] = c.selectbox('Aspect ratio', ratios,
+                                       index=ratios.index(shot['aspect_ratio']) if shot['aspect_ratio'] in ratios else 0,
+                                       key=f'ratio_{selection}')
+    image_choices = [''] + list(p['images'].keys())
+    shot['image_name'] = st.selectbox('First-frame image (optional)', image_choices,
+                                      index=image_choices.index(shot['image_name']) if shot['image_name'] in image_choices else 0,
+                                      format_func=lambda x: x or 'No image — text to video', key=f'img_{selection}')
+    if shot['image_name']:
+        st.image(p['images'][shot['image_name']], width=280)
+
+    st.write(f"**Status:** {shot['status']}" + (' • Approved ✓' if shot['approved'] else ''))
+    if shot['task_id']:
+        st.caption('Task ID: ' + shot['task_id'])
+    if shot['error']:
+        st.error(shot['error'])
+    if shot['video_url']:
+        st.video(shot['video_url'])
+        st.link_button('⬇️ Open/download video', shot['video_url'])
+
+    st.divider()
+    st.subheader('Generate & review')
+    st.warning('Video generation is a paid API request. Costs vary by model/settings. Estimates below are planning figures, not a guarantee of Kling billing. Check Kling pricing before large batches.')
+    ready = [s for s in p['shots'] if s['status'] == 'draft' and s['prompt'].strip()]
+    st.write(f'**Ready drafts:** {len(ready)} | **Total draft duration:** {sum(s["duration"] for s in ready)} seconds')
+    st.caption('At an illustrative rate of 1 unit/second, those drafts would use ' + str(sum(s['duration'] for s in ready)) + ' units. Higher resolutions or other settings may cost more.')
+
+    if st.button('🔄 Check all task statuses', use_container_width=True):
+        try:
+            updated = check_tasks(p)
+            st.success(f'Checked {updated} task(s)')
+            if p['mode'] == 'Batch' and p['batch_active']:
+                submitted = batch_fill(p)
+                if submitted:
+                    st.info(f'Submitted {submitted} more shot(s)')
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+    if p['mode'] == 'Review & Approve':
+        current = next_review_shot(p)
+        if current is None:
+            st.success('All shots approved!')
+        else:
+            idx = p['shots'].index(current)
+            st.info(f"Next approval required: Shot {idx + 1:03d} — {current['title']} ({current['status']})")
+            if current['status'] == 'draft':
+                if st.button('🎥 Generate next unapproved shot (paid)', use_container_width=True):
+                    st.session_state.confirm_paid = True
+                if st.session_state.get('confirm_paid'):
+                    st.write(f"Confirm paid generation: **{current['title']}**, {current['duration']}s, {current['resolution']}")
+                    x, y = st.columns(2)
+                    if x.button('Confirm & submit', type='primary'):
+                        st.session_state.confirm_paid = False
+                        try:
+                            submit(current, p)
+                            st.success('Task submitted')
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
+                    if y.button('Cancel'):
+                        st.session_state.confirm_paid = False
+                        st.rerun()
+            elif current['status'] == 'succeeded':
+                if current['video_url']:
+                    st.video(current['video_url'])
+                if st.button('✅ Approve & generate next shot', type='primary', use_container_width=True):
+                    current['approved'] = True
+                    nxt = next_review_shot(p)
+                    if nxt is not None and nxt['status'] == 'draft':
+                        try:
+                            submit(nxt, p)
+                            st.success('Approved; next paid shot submitted')
+                        except Exception as exc:
+                            st.error('Approved, but next shot not submitted: ' + str(exc))
+                    st.rerun()
+            elif current['status'] in ('submitted', 'processing', 'pending', 'running'):
+                st.info('Wait for this shot to finish. Tap Check all task statuses to refresh.')
+            else:
+                st.info('This shot needs attention. Edit it and use Retry below if needed.')
     else:
-        idx = p['shots'].index(current)
-        st.info(f"Next approval required: Shot {idx + 1:03d} — {current['title']} ({current['status']})")
-        if current['status'] == 'draft':
-            if st.button('🎥 Generate next unapproved shot (paid)', use_container_width=True):
+        if not p['batch_active']:
+            if st.button('🎥 Start batch (paid requests, max 5 at a time)', use_container_width=True):
                 st.session_state.confirm_paid = True
             if st.session_state.get('confirm_paid'):
-                st.write(f"Confirm paid generation: **{current['title']}**, {current['duration']}s, {current['resolution']}")
+                st.write(f"Ready to submit up to 5 shots now; {len(ready)} draft shots are ready in total. Each successful submission costs credits.")
                 x, y = st.columns(2)
-                if x.button('Confirm & submit', type='primary'):
+                if x.button('Confirm & start batch', type='primary'):
                     st.session_state.confirm_paid = False
-                    try:
-                        submit(current, p)
-                        st.success('Task submitted')
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(str(exc))
-                if y.button('Cancel'):
+                    p['batch_active'] = True
+                    n = batch_fill(p)
+                    st.success(f'Submitted {n} shot(s). Use Check all task statuses to advance the queue.')
+                    st.rerun()
+                if y.button('Cancel batch start'):
                     st.session_state.confirm_paid = False
                     st.rerun()
-        elif current['status'] == 'succeeded':
-            if current['video_url']:
-                st.video(current['video_url'])
-            if st.button('✅ Approve & generate next shot', type='primary', use_container_width=True):
-                current['approved'] = True
-                nxt = next_review_shot(p)
-                if nxt is not None and nxt['status'] == 'draft':
-                    try:
-                        submit(nxt, p)
-                        st.success('Approved; next paid shot submitted')
-                    except Exception as exc:
-                        st.error('Approved, but next shot not submitted: ' + str(exc))
-                st.rerun()
-        elif current['status'] in ('submitted', 'processing', 'pending', 'running'):
-            st.info('Wait for this shot to finish. Tap Check all task statuses to refresh.')
         else:
-            st.info('This shot needs attention. Edit it and use Retry below if needed.')
-else:
-    if not p['batch_active']:
-        if st.button('🎥 Start batch (paid requests, max 5 at a time)', use_container_width=True):
-            st.session_state.confirm_paid = True
-        if st.session_state.get('confirm_paid'):
-            st.write(f"Ready to submit up to 5 shots now; {len(ready)} draft shots are ready in total. Each successful submission costs credits.")
-            x, y = st.columns(2)
-            if x.button('Confirm & start batch', type='primary'):
-                st.session_state.confirm_paid = False
-                p['batch_active'] = True
-                n = batch_fill(p)
-                st.success(f'Submitted {n} shot(s). Use Check all task statuses to advance the queue.')
+            st.info('Batch queue active. Each time you press Check all task statuses, finished tasks free slots and the next drafts are submitted.')
+            if st.button('⏸ Pause batch (does not cancel running tasks)'):
+                p['batch_active'] = False
                 st.rerun()
-            if y.button('Cancel batch start'):
-                st.session_state.confirm_paid = False
+
+    st.divider()
+    st.subheader('Shot controls')
+    if shot['status'] in ('failed', 'error', 'canceled', 'succeeded'):
+        st.caption('Retry creates a NEW paid video request. The previous task/video link will be replaced in this project. Save your project or download the old clip first.')
+        if st.checkbox('I understand retry uses more credits', key=f'retry_ack_{selection}'):
+            if st.button('🔁 Reset this shot to draft for retry'):
+                shot.update(task_id='', status='draft', video_url='', approved=False, error='')
                 st.rerun()
-    else:
-        st.info('Batch queue active. Each time you press Check all task statuses, finished tasks free slots and the next drafts are submitted.')
-        if st.button('⏸ Pause batch (does not cancel running tasks)'):
-            p['batch_active'] = False
+    if len(p['shots']) > 1 and st.checkbox('Enable delete selected shot', key='delete_ack'):
+        if st.button('🗑️ Delete selected shot'):
+            p['shots'].pop(selection)
+            for i, s in enumerate(p['shots'], 1):
+                s['id'] = i
+            st.session_state.selected = 0
             st.rerun()
 
-st.divider()
-st.subheader('Shot controls')
-if shot['status'] in ('failed', 'error', 'canceled', 'succeeded'):
-    st.caption('Retry creates a NEW paid video request. The previous task/video link will be replaced in this project. Save your project or download the old clip first.')
-    if st.checkbox('I understand retry uses more credits', key=f'retry_ack_{selection}'):
-        if st.button('🔁 Reset this shot to draft for retry'):
-            shot.update(task_id='', status='draft', video_url='', approved=False, error='')
-            st.rerun()
-if len(p['shots']) > 1 and st.checkbox('Enable delete selected shot', key='delete_ack'):
-    if st.button('🗑️ Delete selected shot'):
-        p['shots'].pop(selection)
-        for i, s in enumerate(p['shots'], 1):
-            s['id'] = i
-        st.session_state.selected = 0
-        st.rerun()
+    st.divider()
+    st.subheader('Completed video gallery')
+    completed = [s for s in p['shots'] if s['status'] == 'succeeded' and s['video_url']]
+    for s in completed:
+        with st.expander(f"{s['title']} {'✓ Approved' if s['approved'] else '• Awaiting approval'}"):
+            st.video(s['video_url'])
+            st.link_button('Open video / download', s['video_url'])
 
-st.divider()
-st.subheader('Completed video gallery')
-completed = [s for s in p['shots'] if s['status'] == 'succeeded' and s['video_url']]
-for s in completed:
-    with st.expander(f"{s['title']} {'✓ Approved' if s['approved'] else '• Awaiting approval'}"):
-        st.video(s['video_url'])
-        st.link_button('Open video / download', s['video_url'])
+    st.caption('Kling video URLs may expire (often within 30 days). Download completed clips promptly. This app cannot guarantee persistent storage or automatic video downloads.')
 
-st.caption('Kling video URLs may expire (often within 30 days). Download completed clips promptly. This app cannot guarantee persistent storage or automatic video downloads.')
+with recover_tab:
+    st.divider()
+    st.subheader('📼 Recover previous Kling videos')
+    st.caption('Read-only recovery from Kling API task history (last 30 days). This does NOT generate new videos or spend generation credits.')
+    if 'recovered_tasks' not in st.session_state:
+        st.session_state.recovered_tasks = []
+    if st.button('🔎 Find previous video tasks (no generation charge)'):
+        try:
+            collected = []
+            cursor = ''
+            seen = set()
+            for page in range(10):
+                query = {'limit': 100, 'filters': [{'key': 'product_type', 'values': ['video']}], 'cursor': cursor}
+                data = api('POST', '/tasks', query)
+                if not isinstance(data, dict):
+                    raise RuntimeError('Unexpected task-history response from Kling')
+                results = data.get('result') or []
+                for item in results:
+                    if isinstance(item, dict) and str(item.get('id', '')) not in seen:
+                        collected.append(item)
+                        seen.add(str(item.get('id', '')))
+                new_cursor = str(data.get('next_cursor') or '')
+                if not data.get('has_more') or not new_cursor or new_cursor == cursor:
+                    break
+                cursor = new_cursor
+            st.session_state.recovered_tasks = collected
+            st.success(f'Found {len(collected)} recent video task(s). This includes unfinished or failed tasks.')
+        except Exception as exc:
+            st.error(f'Could not retrieve task history: {exc}')
+    recovered = st.session_state.recovered_tasks
+    if recovered:
+        st.caption('Download successful videos promptly; Kling says generated results are cleared after 30 days. These are separate from your current storyboard.')
+        for item in recovered:
+            task_id = str(item.get('id', 'unknown'))
+            status = str(item.get('status', 'unknown')).lower()
+            with st.expander(f'Task {task_id} — {status}', expanded=(status == 'succeeded')):
+                st.code(task_id)
+                if item.get('message'):
+                    st.caption(str(item['message']))
+                videos = [o for o in (item.get('outputs') or []) if isinstance(o, dict) and o.get('type') == 'video' and o.get('url')]
+                if videos:
+                    for n, output in enumerate(videos, 1):
+                        url = str(output['url'])
+                        st.video(url)
+                        st.link_button(f'Open / save video {n}', url)
+                elif status == 'succeeded':
+                    st.warning('Task succeeded but no downloadable video URL was returned.')
+                else:
+                    st.info('No completed video available for this task yet.')
+
