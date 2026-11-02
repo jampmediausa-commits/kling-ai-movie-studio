@@ -1,9 +1,7 @@
 import base64
-import io
 import json
 import time
-import zipfile
-from copy import deepcopy
+from datetime import datetime
 
 import requests
 import streamlit as st
@@ -73,8 +71,7 @@ def api(method, path, payload=None):
         raise RuntimeError('KLING_API_KEY is missing from Streamlit Secrets')
     headers = {'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'}
     try:
-        response = requests.request(method, BASE + path, headers=headers,
-                                    json=payload, timeout=45)
+        response = requests.request(method, BASE + path, headers=headers, json=payload, timeout=45)
         response.raise_for_status()
         result = response.json()
     except requests.RequestException as exc:
@@ -84,6 +81,48 @@ def api(method, path, payload=None):
     if str(result.get('code', 0)) not in ('0', '200'):
         raise RuntimeError(str(result.get('message') or result.get('msg') or result))
     return result.get('data')
+
+
+def account_request(method, path, payload=None, params=None):
+    """Read-only account request using the existing Streamlit secret."""
+    key = secret('KLING_API_KEY')
+    if not key:
+        raise RuntimeError('KLING_API_KEY is missing from Streamlit Secrets')
+    try:
+        response = requests.request(method, BASE + path,
+                                    headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},
+                                    json=payload, params=params, timeout=45)
+        response.raise_for_status()
+        result = response.json()
+    except requests.RequestException as exc:
+        raise RuntimeError(f'Kling account request failed: {type(exc).__name__}') from exc
+    except ValueError as exc:
+        raise RuntimeError('Kling returned unreadable account data') from exc
+    if not isinstance(result, dict) or str(result.get('code', 0)) not in ('0', '200'):
+        raise RuntimeError(str(result.get('message') or result.get('msg') or 'Kling account API error'))
+    data = result.get('data') or {}
+    if not isinstance(data, dict) or str(data.get('code', 0)) not in ('0', '200'):
+        raise RuntimeError(str(data.get('msg') or 'Unexpected Kling account response'))
+    return data
+
+
+def refresh_account_data(days):
+    """Reads account package usage and balance deductions; never generates videos."""
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - int(days) * 86400 * 1000
+    packages_data = account_request('GET', '/account/costs', params={
+        'start_time': start_ms, 'end_time': end_ms})
+    billing_data = account_request('POST', '/account/billing/balance', payload={
+        'start_time': start_ms, 'end_time': end_ms, 'limit': 100})
+    result = billing_data.get('result') or {}
+    if not isinstance(result, dict):
+        result = {}
+    details = result.get('detail') or []
+    packages = packages_data.get('resource_pack_subscribe_infos') or []
+    return {'packages': packages if isinstance(packages, list) else [],
+            'details': details if isinstance(details, list) else [],
+            'has_more': bool(billing_data.get('has_more')),
+            'updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 
 def video_download_control(url, key, filename):
@@ -102,8 +141,7 @@ def video_download_control(url, key, filename):
     data = st.session_state.get(f'video_bytes_{key}')
     if data:
         st.download_button('💾 Download MP4 to iPhone', data=data,
-                           file_name=filename, mime='video/mp4',
-                           key=f'download_{key}')
+                           file_name=filename, mime='video/mp4', key=f'download_{key}')
 
 
 def submit(shot, p):
@@ -226,7 +264,7 @@ with st.sidebar:
         st.session_state.unlocked = False
         st.rerun()
 
-generate_tab, recover_tab = st.tabs(['🎬 Generate', '📼 Recover'])
+generate_tab, recover_tab, balance_tab = st.tabs(['🎬 Generate', '📼 Recover', '💰 API Balance'])
 
 with generate_tab:
     st.subheader('Reference image library')
@@ -297,7 +335,6 @@ with generate_tab:
 
     st.divider()
     st.subheader('Generate & review')
-    st.warning('Video generation is a paid API request. Costs vary by model/settings. Estimates below are planning figures, not a guarantee of Kling billing. Check Kling pricing before large batches.')
     ready = [s for s in p['shots'] if s['status'] == 'draft' and s['prompt'].strip()]
     st.write(f'**Ready drafts:** {len(ready)} | **Total draft duration:** {sum(s["duration"] for s in ready)} seconds')
     st.caption('At an illustrative rate of 1 unit/second, those drafts would use ' + str(sum(s['duration'] for s in ready)) + ' units. Higher resolutions or other settings may cost more.')
@@ -454,6 +491,71 @@ with recover_tab:
                         video_download_control(url, f'recovered_{task_id}_{n}', f'kling_{task_id}_{n}.mp4')
                 elif status == 'succeeded':
                     st.warning('Task succeeded but no downloadable video URL was returned.')
-                else:
-                    st.info('No completed video available for this task yet.')
 
+with balance_tab:
+    st.subheader('💰 Kling API Balance')
+    st.caption('Read-only account information. Refreshing does not generate a video.')
+    days = st.selectbox('Billing history period', [7, 30, 90, 365], index=1,
+                        format_func=lambda n: f'Last {n} days', key='balance_days')
+    if st.button('🔄 Refresh API balance', use_container_width=True):
+        try:
+            with st.spinner('Checking Kling account...'):
+                st.session_state.kling_account_data = refresh_account_data(days)
+                st.session_state.kling_account_days = days
+        except Exception as exc:
+            st.error(str(exc))
+    account = st.session_state.get('kling_account_data')
+    if account is None:
+        st.info('Tap Refresh API balance to load your account information.')
+    else:
+        st.caption('Last refreshed: ' + account['updated'] +
+                   f' • History period: {st.session_state.get("kling_account_days", days)} days')
+        st.markdown('#### Resource packages')
+        packs = account['packages']
+        if not packs:
+            st.info('No resource packages were returned for this period. This does not prove that your cash balance is zero.')
+        else:
+            rows = []
+            for pack in packs:
+                if not isinstance(pack, dict):
+                    continue
+                rows.append({'Package': pack.get('resource_pack_name', ''),
+                             'Status': pack.get('status', ''),
+                             'Remaining units': pack.get('remaining_quantity', ''),
+                             'Total units': pack.get('total_quantity', '')})
+            if rows:
+                st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.caption('Kling says resource-package remaining quantities can be delayed by up to 12 hours. Units are not necessarily dollars.')
+        st.markdown('#### Cash balance deductions')
+        details = [d for d in account['details'] if isinstance(d, dict)]
+        if not details:
+            st.info('No cash-balance deductions were returned for this period. A current cash balance cannot be inferred.')
+        else:
+            latest = {}
+            for d in details:
+                group = (str(d.get('currency') or 'Unknown currency'),
+                         str(d.get('cash_type') or 'balance'))
+                try:
+                    timestamp = int(d.get('deduction_time') or 0)
+                except (TypeError, ValueError):
+                    timestamp = 0
+                if group not in latest or timestamp > latest[group][0]:
+                    latest[group] = (timestamp, d.get('balance_after_deduction'))
+            for (currency, kind), (_, amount) in latest.items():
+                st.metric(f'Latest reported balance after deduction ({currency}, {kind})',
+                          f'{amount} {currency}' if amount is not None else 'Unavailable')
+            st.caption('This is the balance after the most recent returned charge, not a guaranteed live wallet balance.')
+            rows = []
+            for d in details:
+                try:
+                    when = datetime.fromtimestamp(int(d.get('deduction_time', 0)) / 1000).strftime('%Y-%m-%d %H:%M')
+                except (TypeError, ValueError, OverflowError, OSError):
+                    when = ''
+                rows.append({'Date': when, 'Task ID': d.get('task_id', ''),
+                             'Model': d.get('model_name', ''), 'Resolution': d.get('resolution', ''),
+                             'Charge': d.get('deduction_amount', ''), 'Currency': d.get('currency', ''),
+                             'Balance after': d.get('balance_after_deduction', '')})
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+            if account['has_more']:
+                st.warning('More billing records exist. Only the first 100 are shown; this is not a complete spending total.')
+        st.caption('For an authoritative live balance, also check your Kling developer console.')
