@@ -206,6 +206,55 @@ with st.sidebar:
         st.session_state.unlocked = False
         st.rerun()
 
+st.divider()
+st.subheader('📼 Recover previous Kling videos')
+st.caption('Read-only recovery from Kling API task history (last 30 days). This does NOT generate new videos or spend generation credits.')
+if 'recovered_tasks' not in st.session_state:
+    st.session_state.recovered_tasks = []
+if st.button('🔎 Find previous video tasks (no generation charge)'):
+    try:
+        collected = []
+        cursor = ''
+        seen = set()
+        for page in range(10):
+            query = {'limit': 100, 'filters': [{'key': 'product_type', 'values': ['video']}], 'cursor': cursor}
+            data = api('POST', '/tasks', query)
+            if not isinstance(data, dict):
+                raise RuntimeError('Unexpected task-history response from Kling')
+            results = data.get('result') or []
+            for item in results:
+                if isinstance(item, dict) and str(item.get('id', '')) not in seen:
+                    collected.append(item)
+                    seen.add(str(item.get('id', '')))
+            new_cursor = str(data.get('next_cursor') or '')
+            if not data.get('has_more') or not new_cursor or new_cursor == cursor:
+                break
+            cursor = new_cursor
+        st.session_state.recovered_tasks = collected
+        st.success(f'Found {len(collected)} recent video task(s). This includes unfinished or failed tasks.')
+    except Exception as exc:
+        st.error(f'Could not retrieve task history: {exc}')
+recovered = st.session_state.recovered_tasks
+if recovered:
+    st.caption('Download successful videos promptly; Kling says generated results are cleared after 30 days. These are separate from your current storyboard.')
+    for item in recovered:
+        task_id = str(item.get('id', 'unknown'))
+        status = str(item.get('status', 'unknown')).lower()
+        with st.expander(f'Task {task_id} — {status}', expanded=(status == 'succeeded')):
+            st.code(task_id)
+            if item.get('message'):
+                st.caption(str(item['message']))
+            videos = [o for o in (item.get('outputs') or []) if isinstance(o, dict) and o.get('type') == 'video' and o.get('url')]
+            if videos:
+                for n, output in enumerate(videos, 1):
+                    url = str(output['url'])
+                    st.video(url)
+                    st.link_button(f'Open / save video {n}', url)
+            elif status == 'succeeded':
+                st.warning('Task succeeded but no downloadable video URL was returned.')
+            else:
+                st.info('No completed video available for this task yet.')
+
 st.subheader('Reference image library')
 st.caption('Images uploaded here are FIRST FRAMES for shots, not a persistent character identity model. Create a full scene image for each shot for best consistency.')
 images_upload = st.file_uploader('Add scene/reference images', type=['png', 'jpg', 'jpeg', 'webp'], accept_multiple_files=True)
@@ -376,4 +425,4 @@ for s in completed:
         st.video(s['video_url'])
         st.link_button('Open video / download', s['video_url'])
 
-st.caption('Kling video URLs may expire (often within 30 days). Download completed clips promptly. This app cannot guarantee persistent storage or automatic video downloads.') 
+st.caption('Kling video URLs may expire (often within 30 days). Download completed clips promptly. This app cannot guarantee persistent storage or automatic video downloads.')
