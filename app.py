@@ -291,7 +291,8 @@ with generate_tab:
         st.error(shot['error'])
     if shot['video_url']:
         st.video(shot['video_url'])
-        st.link_button('Open / save video', shot['video_url'])
+        st.link_button('📱 Save to Photos (open video)', shot['video_url'])
+        st.caption('On iPhone: open the video, tap Share, then Save Video. If Save Video is missing, use the MP4 download and save it to Photos from Files.')
         video_download_control(shot['video_url'], f'shot_preview_{shot["id"]}', f'shot_{shot["id"]:03d}.mp4')
 
     st.divider()
@@ -398,7 +399,8 @@ with generate_tab:
     for s in completed:
         with st.expander(f"{s['title']} {'✓ Approved' if s['approved'] else '• Awaiting approval'}"):
             st.video(s['video_url'])
-            st.link_button('Open video / save', s['video_url'])
+            st.link_button('📱 Save to Photos (open video)', s['video_url'])
+            st.caption('iPhone: tap Share → Save Video after opening. If unavailable, download the MP4 and share it from Files to Photos.')
             video_download_control(s['video_url'], f'gallery_{s["id"]}', f'shot_{s["id"]:03d}.mp4')
 
     st.caption('Kling video URLs may expire (often within 30 days). Download completed clips promptly. This app cannot guarantee persistent storage or automatic video downloads.')
@@ -447,7 +449,8 @@ with recover_tab:
                     for n, output in enumerate(videos, 1):
                         url = str(output['url'])
                         st.video(url)
-                        st.link_button(f'Open / save video {n}', url)
+                        st.link_button(f'📱 Save to Photos — video {n}', url)
+                        st.caption('iPhone: open video → Share → Save Video. Or download MP4 and save from Files.')
                         video_download_control(url, f'recovered_{task_id}_{n}', f'kling_{task_id}_{n}.mp4')
                 elif status == 'succeeded':
                     st.warning('Task succeeded but no downloadable video URL was returned.')
