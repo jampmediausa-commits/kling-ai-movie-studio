@@ -1,127 +1,487 @@
-import os, json, time, base64
+
+import os
+import json
+import base64
+import hmac
+
 import requests
-import jwt
 import streamlit as st
 
-st.set_page_config(page_title='Kling AI Movie Studio', page_icon='🎬', layout='wide')
-st.title('🎬 Kling AI Movie Studio')
-st.caption('Storyboard → approved image → Kling video → download')
+API = "https://api-singapore.klingai.com"
 
-API = 'https://api.klingai.com'
+st.set_page_config(
+    page_title="Kling AI Movie Studio",
+    page_icon="🎬",
+    layout="wide"
+)
 
-def credentials():
-    # Set as hosting secrets/environment variables; never commit credentials.
+
+def secret(name):
     try:
-        ak = st.secrets.get('KLING_ACCESS_KEY', '')
-        sk = st.secrets.get('KLING_SECRET_KEY', '')
+        return str(st.secrets.get(name, "")).strip()
     except Exception:
-        ak = sk = ''
-    return os.getenv('KLING_ACCESS_KEY', ak), os.getenv('KLING_SECRET_KEY', sk)
+        return os.getenv(name, "").strip()
 
-def headers(ak, sk):
-    now = int(time.time())
-    token = jwt.encode({'iss': ak, 'exp': now + 1800, 'nbf': now - 5}, sk, algorithm='HS256', headers={'alg':'HS256','typ':'JWT'})
-    return {'Authorization': f'Bearer {token}', 'Content-Type':'application/json'}
 
-def api_call(method, path, ak, sk, payload=None):
-    response = requests.request(method, API + path, headers=headers(ak, sk), json=payload, timeout=45)
-    response.raise_for_status()
-    result = response.json()
-    if result.get('code') not in (0, '0', None):
-        raise RuntimeError(f"Kling API: {result.get('message', result)}")
-    return result.get('data') or {}
+API_KEY = secret("KLING_API_KEY")
+APP_PASSWORD = secret("APP_PASSWORD")
 
-if 'shots' not in st.session_state:
-    st.session_state.shots = [{'title':'Shot 001 — Opening','prompt':'A moonlit forest. The camera slowly moves forward between trees. Wind and forest sound effects only, no music.','aspect':'9:16','duration':'5','task_id':'','video_url':''}]
 
-ak, sk = credentials()
-with st.sidebar:
-    st.header('Kling API')
-    st.write('Credentials are read from server secrets, never entered into this page.')
-    st.success('Credentials configured' if ak and sk else 'Credentials not configured yet')
-    model = st.text_input('Kling model name', value='kling-v1', help='Change only to a model enabled for your API account. Model capabilities vary.')
-    st.warning('Generating clips may incur API charges. Confirm your Kling balance and pricing before clicking Generate.')
-    st.caption('Use a private deployment with authentication; a private GitHub repository does NOT make a hosted website private.')
+def api_call(method, path, payload=None, params=None):
+    if not API_KEY:
+        raise RuntimeError("KLING_API_KEY is not configured.")
 
-st.subheader('Storyboard')
-up = st.file_uploader('Import storyboard JSON', type='json')
-if up and st.button('Import storyboard'):
+    response = requests.request(
+        method,
+        API + path,
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json=payload,
+        params=params,
+        timeout=90
+    )
+
     try:
-        obj = json.load(up)
-        items = obj['shots'] if isinstance(obj,dict) else obj
-        st.session_state.shots = [{'title':str(s.get('title','Untitled')), 'prompt':str(s.get('prompt','')), 'aspect':s.get('aspect','9:16'), 'duration':str(s.get('duration','5')), 'task_id':'', 'video_url':''} for s in items]
+        result = response.json()
+    except ValueError:
+        raise RuntimeError(
+            f"HTTP {response.status_code}: {response.text[:500]}"
+        )
+
+    if not response.ok or result.get("code") not in (0, "0"):
+        raise RuntimeError(
+            f"HTTP {response.status_code}: {result}"
+        )
+
+    return result.get("data")
+
+
+def new_shot():
+    return {
+        "title": "New Shot",
+        "prompt": "",
+        "aspect": "16:9",
+        "duration": 5,
+        "resolution": "720p",
+        "audio": "off",
+        "task_id": "",
+        "video_url": "",
+        "status": "",
+        "message": ""
+    }
+
+
+def normalize_shot(data):
+    shot = new_shot()
+
+    if isinstance(data, dict):
+        for key in shot:
+            if key in data:
+                shot[key] = data[key]
+
+    shot["title"] = str(shot["title"])
+    shot["prompt"] = str(shot["prompt"])
+    shot["task_id"] = str(shot["task_id"] or "")
+    shot["video_url"] = str(shot["video_url"] or "")
+
+    if shot["aspect"] not in ("16:9", "9:16", "1:1"):
+        shot["aspect"] = "16:9"
+
+    try:
+        shot["duration"] = int(shot["duration"])
+    except (TypeError, ValueError):
+        shot["duration"] = 5
+
+    if shot["duration"] not in range(3, 16):
+        shot["duration"] = 5
+
+    if shot["resolution"] not in ("720p", "1080p", "4k"):
+        shot["resolution"] = "720p"
+
+    if shot["audio"] not in ("off", "native"):
+        shot["audio"] = "off"
+
+    return shot
+
+
+if "shots" not in st.session_state:
+    st.session_state.shots = [new_shot()]
+
+if "authorized" not in st.session_state:
+    st.session_state.authorized = False
+
+
+st.title("🎬 Kling AI Movie Studio")
+st.caption("Storyboard and video generation with Kling 3.0")
+
+
+# Password protection
+if not APP_PASSWORD:
+    st.error(
+        "APP_PASSWORD is missing. Configure it in "
+        "Streamlit Secrets before using this app."
+    )
+    st.stop()
+
+if not st.session_state.authorized:
+    with st.form("login"):
+        password = st.text_input(
+            "Studio password",
+            type="password"
+        )
+        login = st.form_submit_button("Unlock Studio")
+
+    if login:
+        if hmac.compare_digest(password, APP_PASSWORD):
+            st.session_state.authorized = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+
+    st.stop()
+
+
+with st.sidebar:
+    st.header("Studio Controls")
+
+    if API_KEY:
+        st.success("Kling API key configured")
+    else:
+        st.warning("Kling API key is missing")
+
+    st.info(
+        "Video generation uses paid Kling API credits. "
+        "Check your balance before submitting tasks."
+    )
+
+    if st.button("Lock Studio"):
+        st.session_state.authorized = False
         st.rerun()
-    except Exception as e:
-        st.error(f'Invalid JSON: {e}')
-if st.button('➕ Add shot'):
-    st.session_state.shots.append({'title':f'Shot {len(st.session_state.shots)+1:03d}','prompt':'','aspect':'9:16','duration':'5','task_id':'','video_url':''})
-    st.rerun()
-export = {'shots':[{k:s[k] for k in ('title','prompt','aspect','duration','task_id','video_url')} for s in st.session_state.shots]}
-st.download_button('⬇️ Export storyboard and task IDs', json.dumps(export,indent=2), 'kling_storyboard.json', 'application/json')
-st.caption('Save the JSON frequently. Reference images are not included in the export and must be uploaded again after restarting.')
+
+    st.divider()
+
+    if st.button("➕ Add Shot", use_container_width=True):
+        st.session_state.shots.append(new_shot())
+        st.rerun()
+
+    storyboard_json = json.dumps(
+        st.session_state.shots,
+        indent=2
+    )
+
+    st.download_button(
+        "⬇️ Export Storyboard",
+        data=storyboard_json,
+        file_name="kling_storyboard.json",
+        mime="application/json",
+        use_container_width=True
+    )
+
+    imported = st.file_uploader(
+        "Import Storyboard JSON",
+        type=["json"],
+        key="storyboard_import"
+    )
+
+    if imported is not None:
+        if st.button("Load Imported Storyboard"):
+            try:
+                loaded = json.load(imported)
+
+                if isinstance(loaded, dict):
+                    loaded = loaded.get("shots", [])
+
+                if not isinstance(loaded, list):
+                    raise ValueError("Expected a list of shots.")
+
+                if not loaded:
+                    raise ValueError("Storyboard is empty.")
+
+                st.session_state.shots = [
+                    normalize_shot(item)
+                    for item in loaded
+                ]
+
+                st.rerun()
+            except Exception as error:
+                st.error(f"Import failed: {error}")
+
+
+st.subheader("🎞️ Storyboard")
+
+st.write(
+    "Create individual shots. Add a reference image "
+    "for image-to-video, or leave it empty for text-to-video."
+)
 
 for i, shot in enumerate(st.session_state.shots):
-    with st.expander(f"{i+1:03d} · {shot['title']}", expanded=i==0):
-        shot['title'] = st.text_input('Title', shot['title'], key=f't_{i}')
-        shot['prompt'] = st.text_area('Video prompt', shot['prompt'], key=f'p_{i}', height=130)
-        c1,c2 = st.columns(2)
-        shot['aspect'] = c1.selectbox('Aspect ratio', ['9:16','16:9','1:1'], index=['9:16','16:9','1:1'].index(shot['aspect']) if shot['aspect'] in ('9:16','16:9','1:1') else 0, key=f'a_{i}')
-        shot['duration'] = c2.selectbox('Duration (seconds)', ['5','10'], index=['5','10'].index(shot['duration']) if shot['duration'] in ('5','10') else 0, key=f'd_{i}')
-        photo = st.file_uploader('Approved starting image (optional)', type=['jpg','jpeg','png'], key=f'img_{i}')
+
+    with st.expander(
+        f"Shot {i + 1}: {shot['title']}",
+        expanded=True
+    ):
+
+        shot["title"] = st.text_input(
+            "Shot title",
+            value=shot["title"],
+            key=f"title_{i}"
+        )
+
+        shot["prompt"] = st.text_area(
+            "Video prompt",
+            value=shot["prompt"],
+            height=150,
+            key=f"prompt_{i}"
+        )
+
+        c1, c2 = st.columns(2)
+
+        shot["aspect"] = c1.selectbox(
+            "Aspect ratio",
+            ["16:9", "9:16", "1:1"],
+            index=["16:9", "9:16", "1:1"].index(
+                shot["aspect"]
+            ),
+            key=f"aspect_{i}"
+        )
+
+        shot["duration"] = c2.selectbox(
+            "Duration (seconds)",
+            list(range(3, 16)),
+            index=list(range(3, 16)).index(
+                shot["duration"]
+            ),
+            key=f"duration_{i}"
+        )
+
+        c3, c4 = st.columns(2)
+
+        shot["resolution"] = c3.selectbox(
+            "Resolution",
+            ["720p", "1080p", "4k"],
+            index=["720p", "1080p", "4k"].index(
+                shot["resolution"]
+            ),
+            key=f"resolution_{i}"
+        )
+
+        shot["audio"] = c4.selectbox(
+            "Generated audio",
+            ["off", "native"],
+            index=["off", "native"].index(
+                shot["audio"]
+            ),
+            key=f"audio_{i}"
+        )
+
+        photo = st.file_uploader(
+            "Optional first-frame image",
+            type=["png", "jpg", "jpeg"],
+            key=f"photo_{i}"
+        )
+
         if photo:
-            st.image(photo, width=260)
-        if shot['task_id']:
-            st.caption('Kling task ID: '+shot['task_id'])
-        if shot['video_url']:
-            st.video(shot['video_url'])
-            st.link_button('Open / save video', shot['video_url'])
-        if st.button('🎥 Generate shot — paid API request', key=f'g_{i}', disabled=not(ak and sk and shot['prompt'].strip())):
+            st.image(photo, width=300)
+
+        if shot["task_id"]:
+            st.caption(
+                "Kling task ID: " + shot["task_id"]
+            )
+
+        if shot["status"]:
+            st.info("Task status: " + shot["status"])
+
+        if shot["message"]:
+            st.caption(shot["message"])
+
+        if shot["video_url"]:
+            st.video(shot["video_url"])
+            st.link_button(
+                "Open / Save Video",
+                shot["video_url"]
+            )
+
+        if st.button(
+            "🎥 Generate Shot — Paid API Request",
+            key=f"generate_{i}",
+            disabled=not (
+                API_KEY and shot["prompt"].strip()
+            )
+        ):
             try:
+                settings = {
+                    "resolution": shot["resolution"],
+                    "duration": int(shot["duration"]),
+                    "audio": shot["audio"],
+                    "multi_shot": False
+                }
+
                 if photo:
-                    # Kling image-to-video expects base64 image bytes, not a data URI.
-                    img = base64.b64encode(photo.getvalue()).decode('ascii')
-                    payload = {'model_name':model,'image':img,'prompt':shot['prompt'],'duration':shot['duration']}
-                    path = '/v1/videos/image2video'
+                    if photo.size > 50 * 1024 * 1024:
+                        raise ValueError(
+                            "Image exceeds Kling's 50 MB limit."
+                        )
+
+                    encoded = base64.b64encode(
+                        photo.getvalue()
+                    ).decode("ascii")
+
+                    payload = {
+                        "contents": [
+                            {
+                                "type": "prompt",
+                                "text": shot["prompt"]
+                            },
+                            {
+                                "type": "first_frame",
+                                "url": encoded
+                            }
+                        ],
+                        "settings": settings
+                    }
+
+                    path = "/image-to-video/kling-3.0"
+
                 else:
-                    payload = {'model_name':model,'prompt':shot['prompt'],'duration':shot['duration'],'aspect_ratio':shot['aspect']}
-                    path = '/v1/videos/text2video'
-                data = api_call('POST',path,ak,sk,payload)
-                shot['task_id'] = data.get('task_id','')
-                shot['video_url'] = ''
-                if not shot['task_id']:
-                    st.error(f'No task ID returned: {data}')
-                else:
-                    st.success('Submitted! Use Check status after processing.')
-            except Exception as e:
-                st.error(f'Kling request failed: {e}')
-        if st.button('🔄 Check status',key=f's_{i}',disabled=not(ak and sk and shot['task_id'])):
+                    settings["aspect_ratio"] = shot["aspect"]
+
+                    payload = {
+                        "prompt": shot["prompt"],
+                        "settings": settings
+                    }
+
+                    path = "/text-to-video/kling-3.0"
+
+                with st.spinner("Submitting video task..."):
+                    data = api_call(
+                        "POST",
+                        path,
+                        payload=payload
+                    )
+
+                if not isinstance(data, dict):
+                    raise RuntimeError(
+                        f"Unexpected API response: {data}"
+                    )
+
+                task_id = data.get("id")
+
+                if not task_id:
+                    raise RuntimeError(
+                        f"No task ID returned: {data}"
+                    )
+
+                shot["task_id"] = str(task_id)
+                shot["status"] = data.get(
+                    "status", "submitted"
+                )
+                shot["video_url"] = ""
+                shot["message"] = ""
+
+                st.success(
+                    "Task submitted. Use Check Status "
+                    "to retrieve the video."
+                )
+
+            except Exception as error:
+                st.error(str(error))
+
+        if st.button(
+            "🔄 Check Status",
+            key=f"status_{i}",
+            disabled=not (
+                API_KEY and shot["task_id"]
+            )
+        ):
             try:
-                kind = 'image2video' if photo else 'text2video'
-                # A task can be checked after a reload: if photo is missing, try both task types.
-                paths = [f'/v1/videos/{kind}/{shot["task_id"]}']
-                paths += [f'/v1/videos/{"text2video" if kind == "image2video" else "image2video"}/{shot["task_id"]}']
-                data = None
-                for path in paths:
-                    try:
-                        data = api_call('GET',path,ak,sk)
-                        break
-                    except Exception:
-                        continue
-                if data is None:
-                    raise RuntimeError('Unable to retrieve task. Check task ID and API credentials.')
-                status = data.get('task_status','unknown')
-                st.info('Task status: '+status)
-                if status == 'succeed':
-                    videos = (data.get('task_result') or {}).get('videos') or []
+                with st.spinner("Checking Kling task..."):
+                    data = api_call(
+                        "GET",
+                        "/tasks",
+                        params={
+                            "task_ids": shot["task_id"]
+                        }
+                    )
+
+                if isinstance(data, list):
+                    tasks = data
+                elif isinstance(data, dict):
+                    tasks = data.get("result", [])
+                    if not tasks and data.get("id"):
+                        tasks = [data]
+                else:
+                    tasks = []
+
+                if not tasks:
+                    raise RuntimeError(
+                        f"No task found: {data}"
+                    )
+
+                task = next(
+                    (
+                        item for item in tasks
+                        if str(item.get("id")) ==
+                        shot["task_id"]
+                    ),
+                    tasks[0]
+                )
+
+                shot["status"] = task.get(
+                    "status", "unknown"
+                )
+                shot["message"] = task.get(
+                    "message", ""
+                ) or ""
+
+                if shot["status"] == "succeeded":
+                    outputs = task.get("outputs") or []
+
+                    videos = [
+                        item for item in outputs
+                        if item.get("type") == "video"
+                        and item.get("url")
+                    ]
+
                     if videos:
-                        shot['video_url'] = videos[0].get('url','')
+                        shot["video_url"] = videos[0]["url"]
+                        st.success("Video is ready!")
                         st.rerun()
-                elif status == 'failed':
-                    st.error(str(data.get('task_status_msg','Kling reported a failed generation.')))
-            except Exception as e:
-                st.error(f'Status check failed: {e}')
-        if st.button('Remove shot',key=f'r_{i}'):
+                    else:
+                        st.warning(
+                            "Task succeeded, but no video "
+                            "URL was returned."
+                        )
+
+                elif shot["status"] == "failed":
+                    st.error(
+                        shot["message"] or
+                        "Video generation failed."
+                    )
+
+                else:
+                    st.info(
+                        "Current status: " + shot["status"]
+                    )
+
+            except Exception as error:
+                st.error(str(error))
+
+        if st.button(
+            "🗑️ Delete Shot",
+            key=f"delete_{i}"
+        ):
             st.session_state.shots.pop(i)
+
+            if not st.session_state.shots:
+                st.session_state.shots = [new_shot()]
+
             st.rerun()
 
-st.caption('Prototype only. No persistent database, access control, or cost limits. Do not deploy publicly without authentication and quotas. Kling API endpoints/models may vary by account and should be verified before paid testing.')
+
+st.divider()
+st.caption(
+    "Kling AI Movie Studio | Kling 3.0 | "
+    "Save generated videos promptly."
+)
