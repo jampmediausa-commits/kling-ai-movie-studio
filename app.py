@@ -26,7 +26,8 @@ def blank_shot(n):
     return {'id': n, 'title': f'Shot {n:03d}', 'prompt': '', 'duration': 3,
             'resolution': '720p', 'aspect_ratio': '16:9', 'image_name': '',
             'task_id': '', 'status': 'draft', 'video_url': '', 'approved': False,
-            'error': ''}
+            'error': '', 'dialogue': '', 'voice_id': '',
+            'speaker': 'Character', 'voice_direction': ''}
 
 
 def new_project():
@@ -153,7 +154,26 @@ def submit(shot, p):
         raise RuntimeError('This shot already has a task. Use Retry only if you want a new paid generation.')
     if not shot['prompt'].strip():
         raise RuntimeError(f"{shot['title']}: enter a video prompt first")
-    contents = [{'type': 'prompt', 'text': shot['prompt']}]
+    # Kling 4.0 Omni: dialogue is part of the text prompt; an existing
+    # registered voice can be referenced using an @id material marker.
+    prompt_text = shot['prompt'].strip()
+    dialogue = str(shot.get('dialogue', '')).strip()
+    voice_id = str(shot.get('voice_id', '')).strip()
+    if voice_id and not dialogue:
+        raise RuntimeError(f"{shot['title']}: enter dialogue to use the selected voice")
+    if dialogue:
+        speaker = str(shot.get('speaker', '')).strip() or 'Character'
+        direction = str(shot.get('voice_direction', '')).strip()
+        if voice_id:
+            speech = f'{speaker} speaks using voice @voice_1 and says: {json.dumps(dialogue, ensure_ascii=False)}.'
+        else:
+            speech = f'{speaker} says aloud: {json.dumps(dialogue, ensure_ascii=False)}.'
+        if direction:
+            speech += f' Voice delivery: {direction}.'
+        prompt_text += '\n\nDialogue and sound: ' + speech + ' Keep the spoken words synchronized with the speaker.'
+    contents = [{'type': 'prompt', 'text': prompt_text}]
+    if voice_id:
+        contents.append({'type': 'voice', 'voice_id': voice_id, 'id': 'voice_1'})
     image_name = shot.get('image_name', '')
     if image_name:
         if image_name not in p['images']:
@@ -377,6 +397,29 @@ with generate_tab:
                                       format_func=lambda x: x or 'No image — text to video', key=f'img_{selection}')
     if shot['image_name']:
         st.image(p['images'][shot['image_name']], width=280)
+
+    st.markdown('#### 🎙️ Voice & Audio')
+    st.caption('Add spoken dialogue to this shot. For consistent character voices, use a Kling voice ID already created in Kling Voice Management. Voice generation may change credit usage.')
+    shot['dialogue'] = st.text_area('Spoken dialogue (optional)',
+                                    value=shot.get('dialogue', ''),
+                                    placeholder='I have waited twenty years for this moment.',
+                                    height=90, key=f'dialogue_{selection}')
+    voice_col1, voice_col2 = st.columns(2)
+    shot['speaker'] = voice_col1.text_input('Speaker / character',
+                                             value=shot.get('speaker', 'Character'),
+                                             key=f'speaker_{selection}')
+    shot['voice_id'] = voice_col2.text_input('Existing Kling voice ID (optional)',
+                                              value=shot.get('voice_id', ''),
+                                              key=f'voice_id_{selection}',
+                                              help='Paste a voice ID from Kling Voice Management; do not paste an audio URL or filename.')
+    shot['voice_direction'] = st.text_input('Voice delivery (optional)',
+                                             value=shot.get('voice_direction', ''),
+                                             placeholder='Calm, serious, natural American accent; no music',
+                                             key=f'voice_direction_{selection}')
+    if shot['dialogue'].strip() and not shot['voice_id'].strip():
+        st.caption('No voice ID: Kling will interpret the dialogue and voice direction from the prompt. Exact voice consistency is not guaranteed.')
+    if shot['voice_id'].strip():
+        st.caption('Registered voice reference enabled. This is not an MP3/WAV uploader; the voice ID must already exist and be accessible to your Kling API account.')
 
     st.write(f"**Status:** {shot['status']}" + (' • Approved ✓' if shot['approved'] else ''))
     if shot['task_id']:
