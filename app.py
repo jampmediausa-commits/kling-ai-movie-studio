@@ -1,6 +1,10 @@
 import base64
+import hashlib
+import hmac
+import secrets
 import json
 import time
+from streamlit_cookies_controller import CookieController
 from datetime import datetime
 
 import requests
@@ -222,17 +226,68 @@ def batch_fill(p):
     return submitted
 
 
+# Persistent login: signed, time-limited token; never store the password in a cookie.
+# AUTH_SECRET is recommended in Streamlit Secrets; otherwise derive a signing key
+# from the existing password and API key (both must be kept private).
+LOGIN_COOKIE = 'kling_movie_remember_v1'
+LOGIN_TTL = 30 * 24 * 60 * 60
+
+
+def signing_key():
+    configured = secret('AUTH_SECRET')
+    if configured:
+        return configured.encode('utf-8')
+    return hashlib.sha256((secret('APP_PASSWORD') + ':' + secret('KLING_API_KEY')).encode('utf-8')).digest()
+
+
+def create_login_token():
+    expiry = str(int(time.time()) + LOGIN_TTL)
+    nonce = secrets.token_urlsafe(18)
+    message = f'{expiry}.{nonce}'
+    signature = hmac.new(signing_key(), message.encode('utf-8'), hashlib.sha256).hexdigest()
+    return f'{message}.{signature}'
+
+
+def valid_login_token(token):
+    if not isinstance(token, str) or len(token) > 250:
+        return False
+    try:
+        expiry, nonce, signature = token.split('.')
+        if not expiry.isdigit() or len(nonce) < 12:
+            return False
+        if not int(time.time()) < int(expiry) <= int(time.time()) + LOGIN_TTL + 120:
+            return False
+        expected = hmac.new(signing_key(), f'{expiry}.{nonce}'.encode('utf-8'), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(signature, expected)
+    except (ValueError, TypeError):
+        return False
+
+
 password = secret('APP_PASSWORD')
+cookies = CookieController(key='kling_login_cookies')
 if password and not st.session_state.get('unlocked', False):
-    st.title('🔒 Kling AI Movie Studio')
-    entered = st.text_input('Studio password', type='password')
-    if st.button('Unlock'):
-        if entered == password:
-            st.session_state.unlocked = True
-            st.rerun()
-        else:
-            st.error('Incorrect password')
-    st.stop()
+    remembered = cookies.get(LOGIN_COOKIE)
+    if valid_login_token(remembered):
+        st.session_state.unlocked = True
+    else:
+        st.title('🔒 Kling AI Movie Studio')
+        st.caption('Sign in to access your Kling API credits and movie projects.')
+        with st.form('studio_login'):
+            entered = st.text_input('Studio password', type='password')
+            remember = st.checkbox('Remember this device for 30 days', value=True)
+            unlock = st.form_submit_button('Unlock', type='primary')
+        if unlock:
+            if hmac.compare_digest(entered, password):
+                st.session_state.unlocked = True
+                if remember:
+                    cookies.set(LOGIN_COOKIE, create_login_token(), max_age=LOGIN_TTL,
+                                secure=True, same_site='strict', path='/')
+                else:
+                    cookies.remove(LOGIN_COOKIE)
+                st.rerun()
+            else:
+                st.error('Incorrect password')
+        st.stop()
 
 p = get_project()
 st.title('🎬 Kling AI Movie Studio')
@@ -260,7 +315,8 @@ with st.sidebar:
     if st.button('New empty project', use_container_width=True):
         reset_runtime()
         st.rerun()
-    if password and st.button('Lock studio'):
+    if password and st.button('Log out of studio'):
+        cookies.remove(LOGIN_COOKIE)
         st.session_state.unlocked = False
         st.rerun()
 
