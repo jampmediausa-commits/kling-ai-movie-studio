@@ -1,5 +1,6 @@
-
 import base64
+import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -8,20 +9,16 @@ from urllib.parse import quote
 import requests
 import streamlit as st
 
-
 st.set_page_config(
     page_title="Kling AI Movie Studio",
     page_icon="🎬",
     layout="centered",
 )
 
-# ORIGINAL KLING API CONFIGURATION
-# DO NOT CHANGE YOUR STREAMLIT SECRETS.
+# Same API configuration and Streamlit Secrets
+# as your existing app.
 BASE = "https://api-singapore.klingai.com"
 MODEL_PATH = "/omni-video/kling-4.0"
-
-# Local database survives browser-session resets,
-# but may be erased by Streamlit Cloud restarts.
 DB_PATH = Path("/tmp/kling_movie_studio_videos.sqlite3")
 
 
@@ -33,11 +30,7 @@ def secret(name):
 
 
 def connection():
-    db = sqlite3.connect(
-        str(DB_PATH),
-        timeout=20,
-    )
-
+    db = sqlite3.connect(str(DB_PATH), timeout=20)
     db.execute("""
         CREATE TABLE IF NOT EXISTS videos (
             task_id TEXT PRIMARY KEY,
@@ -47,7 +40,6 @@ def connection():
             created INTEGER NOT NULL
         )
     """)
-
     db.commit()
     return db
 
@@ -69,7 +61,6 @@ def save_video(
                 created
             )
             VALUES (?, ?, ?, ?, ?)
-
             ON CONFLICT(task_id)
             DO UPDATE SET
                 prompt = CASE
@@ -77,9 +68,7 @@ def save_video(
                     THEN excluded.prompt
                     ELSE videos.prompt
                 END,
-
                 status = excluded.status,
-
                 video_url = CASE
                     WHEN excluded.video_url != ''
                     THEN excluded.video_url
@@ -94,7 +83,6 @@ def save_video(
                 int(time.time()),
             ),
         )
-
         db.commit()
 
 
@@ -162,11 +150,6 @@ def kling_request(method, path, payload=None):
             "Kling request failed: " + detail
         ) from exc
 
-    except ValueError as exc:
-        raise RuntimeError(
-            "Kling returned invalid JSON."
-        ) from exc
-
     if not isinstance(body, dict):
         raise RuntimeError(
             "Unexpected Kling response."
@@ -209,44 +192,26 @@ def parse_tasks(data):
 def video_from_task(task):
     outputs = task.get("outputs") or []
 
-    if isinstance(outputs, list):
-        for output in outputs:
-            if not isinstance(output, dict):
-                continue
+    for output in outputs:
+        if not isinstance(output, dict):
+            continue
 
-            if (
-                output.get("type") == "video"
-                and output.get("url")
-            ):
-                return str(output["url"])
+        if (
+            output.get("type") == "video"
+            and output.get("url")
+        ):
+            return str(output["url"])
 
     return str(
         task.get("video_url") or ""
     )
 
 
-def refresh_videos():
-    videos = all_videos()
+def recover_ids(ids):
+    found = set()
 
-    pending = [
-        video["task_id"]
-        for video in videos
-        if video["status"] not in (
-            "succeeded",
-            "failed",
-            "canceled",
-        )
-        or not video["video_url"]
-    ]
-
-    for start in range(
-        0,
-        len(pending),
-        20,
-    ):
-        group = pending[
-            start:start + 20
-        ]
+    for start in range(0, len(ids), 20):
+        group = ids[start:start + 20]
 
         path = (
             "/tasks?task_ids="
@@ -265,7 +230,9 @@ def refresh_videos():
             if not isinstance(task, dict):
                 continue
 
-            task_id = task.get("id")
+            task_id = str(
+                task.get("id") or ""
+            )
 
             if not task_id:
                 continue
@@ -282,10 +249,14 @@ def refresh_videos():
                 status = "succeeded"
 
             save_video(
-                task_id=str(task_id),
+                task_id=task_id,
                 status=status,
                 video_url=video_from_task(task),
             )
+
+            found.add(task_id)
+
+    return found
 
 
 def fetch_mp4(url):
@@ -299,6 +270,7 @@ def fetch_mp4(url):
 
     chunks = []
     total = 0
+
     maximum = 250 * 1024 * 1024
 
     for chunk in response.iter_content(
@@ -311,7 +283,7 @@ def fetch_mp4(url):
 
         if total > maximum:
             raise RuntimeError(
-                "Video is larger than 250 MB. "
+                "MP4 exceeds 250 MB. "
                 "Use Open Video instead."
             )
 
@@ -330,9 +302,7 @@ if password and not st.session_state.get(
     "unlocked",
     False,
 ):
-    st.title(
-        "🔒 Kling AI Movie Studio"
-    )
+    st.title("🔒 Kling AI Movie Studio")
 
     with st.form("login"):
         entered = st.text_input(
@@ -340,11 +310,9 @@ if password and not st.session_state.get(
             type="password",
         )
 
-        submitted = (
-            st.form_submit_button(
-                "Unlock",
-                use_container_width=True,
-            )
+        submitted = st.form_submit_button(
+            "Unlock",
+            use_container_width=True,
         )
 
     if submitted:
@@ -352,9 +320,7 @@ if password and not st.session_state.get(
             st.session_state.unlocked = True
             st.rerun()
         else:
-            st.error(
-                "Incorrect password"
-            )
+            st.error("Incorrect password")
 
     st.stop()
 
@@ -363,13 +329,11 @@ if password and not st.session_state.get(
 # MAIN APP
 # ====================================
 
-st.title(
-    "🎬 Kling AI Movie Studio"
-)
+st.title("🎬 Kling AI Movie Studio")
 
 st.caption(
-    "Generate, watch, and download "
-    "your Kling videos."
+    "Generate, watch, recover, "
+    "and download Kling videos."
 )
 
 if not secret("KLING_API_KEY"):
@@ -380,9 +344,10 @@ if not secret("KLING_API_KEY"):
     st.stop()
 
 
-generate_tab, videos_tab = st.tabs([
+generate_tab, videos_tab, recover_tab = st.tabs([
     "🎬 Generate",
     "📹 My Videos",
+    "♻️ Recover Videos",
 ])
 
 
@@ -391,9 +356,7 @@ generate_tab, videos_tab = st.tabs([
 # ====================================
 
 with generate_tab:
-    st.subheader(
-        "Generate Video"
-    )
+    st.subheader("Generate Video")
 
     with st.form("generate_form"):
         uploaded = st.file_uploader(
@@ -409,10 +372,6 @@ with generate_tab:
         prompt = st.text_area(
             "Video Prompt",
             height=150,
-            placeholder=(
-                "Describe what happens "
-                "in your video..."
-            ),
         )
 
         duration = st.selectbox(
@@ -434,12 +393,10 @@ with generate_tab:
             "Kling video request."
         )
 
-        submitted = (
-            st.form_submit_button(
-                "✨ Generate Video",
-                type="primary",
-                use_container_width=True,
-            )
+        submitted = st.form_submit_button(
+            "✨ Generate Video",
+            type="primary",
+            use_container_width=True,
         )
 
     if uploaded:
@@ -473,18 +430,15 @@ with generate_tab:
                 or "image/png"
             )
 
-            encoded = (
-                base64.b64encode(
-                    uploaded.getvalue()
-                ).decode("ascii")
-            )
+            encoded = base64.b64encode(
+                uploaded.getvalue()
+            ).decode("ascii")
 
             image_url = (
                 f"data:{mime};base64,"
                 + encoded
             )
 
-            # ORIGINAL KLING 4.0 PAYLOAD
             payload = {
                 "contents": [
                     {
@@ -515,10 +469,7 @@ with generate_tab:
                     )
 
                 if (
-                    not isinstance(
-                        data,
-                        dict,
-                    )
+                    not isinstance(data, dict)
                     or not data.get("id")
                 ):
                     raise RuntimeError(
@@ -540,9 +491,9 @@ with generate_tab:
                 )
 
                 st.success(
-                    "Video submitted! "
+                    "Video submitted. "
                     "Open My Videos to "
-                    "check and download."
+                    "refresh and download."
                 )
 
             except Exception as exc:
@@ -554,44 +505,55 @@ with generate_tab:
 # ====================================
 
 with videos_tab:
-    st.subheader(
-        "My Videos"
-    )
+    st.subheader("My Videos")
 
     if st.button(
         "🔄 Refresh Videos",
         use_container_width=True,
     ):
-        try:
-            with st.spinner(
-                "Checking Kling..."
-            ):
-                refresh_videos()
+        ids = [
+            video["task_id"]
+            for video in all_videos()
+            if video["status"] not in (
+                "succeeded",
+                "failed",
+                "canceled",
+            )
+            or not video["video_url"]
+        ]
 
-            st.rerun()
+        if ids:
+            try:
+                with st.spinner(
+                    "Checking Kling..."
+                ):
+                    recover_ids(ids)
 
-        except Exception as exc:
-            st.error(str(exc))
+                st.rerun()
+
+            except Exception as exc:
+                st.error(str(exc))
+
+        else:
+            st.info(
+                "No unfinished videos "
+                "to refresh."
+            )
 
     videos = all_videos()
 
     if not videos:
         st.info(
-            "Videos you generate from "
-            "now on will appear here. "
-            "Older videos missing from "
-            "the previous session cannot "
-            "be recovered without "
-            "their task IDs."
+            "No saved videos found. "
+            "Check Recover Videos "
+            "for older task IDs."
         )
 
     for index, video in enumerate(
         videos,
         1,
     ):
-        with st.container(
-            border=True
-        ):
+        with st.container(border=True):
             st.markdown(
                 f"### Video {index}"
             )
@@ -616,14 +578,6 @@ with videos_tab:
                     "📱 Open Video / Save to Photos",
                     video["video_url"],
                     use_container_width=True,
-                )
-
-                st.caption(
-                    "On iPhone, open the video "
-                    "and tap Share → Save Video. "
-                    "If it saves to Files, "
-                    "open the MP4 in Files "
-                    "and share it to Photos."
                 )
 
                 key = (
@@ -653,11 +607,7 @@ with videos_tab:
                 if key in st.session_state:
                     st.download_button(
                         "⬇️ Download MP4",
-                        data=(
-                            st.session_state[
-                                key
-                            ]
-                        ),
+                        data=st.session_state[key],
                         file_name=(
                             "kling_"
                             + video["task_id"]
@@ -667,16 +617,6 @@ with videos_tab:
                         key="download_" + key,
                         use_container_width=True,
                     )
-
-            elif (
-                video["status"]
-                == "succeeded"
-            ):
-                st.warning(
-                    "Kling reported success, "
-                    "but no video URL "
-                    "was returned."
-                )
 
             elif video["status"] in (
                 "failed",
@@ -689,24 +629,207 @@ with videos_tab:
 
             else:
                 st.info(
-                    "Video is processing. "
+                    "No MP4 link yet. "
                     "Tap Refresh Videos "
-                    "to check again."
+                    "to check."
                 )
 
+
+# ====================================
+# TAB 3 — RECOVER VIDEOS
+# ====================================
+
+with recover_tab:
+    st.subheader(
+        "Recover Older Kling Videos"
+    )
+
+    st.info(
+        "Kling's tested /tasks endpoint "
+        "requires task IDs. "
+        "It does NOT provide a complete "
+        "account-wide video history. "
+        "This tab cannot discover "
+        "lost task IDs automatically."
+    )
+
+    st.write(
+        "If you have task IDs from "
+        "a previous project or Kling "
+        "response, paste them here. "
+        "No new videos will be generated."
+    )
+
+    pasted = st.text_area(
+        "Task IDs — one per line "
+        "or separated by commas",
+        height=150,
+    )
+
+    if st.button(
+        "♻️ Recover Videos",
+        use_container_width=True,
+    ):
+        ids = list(dict.fromkeys(
+            x
+            for x in re.split(
+                r"[\s,]+",
+                pasted.strip(),
+            )
+            if x
+        ))
+
+        if not ids:
+            st.warning(
+                "Enter at least one task ID."
+            )
+
+        elif len(ids) > 100:
+            st.error(
+                "Enter up to 100 task IDs "
+                "at a time."
+            )
+
+        else:
+            try:
+                with st.spinner(
+                    "Looking up existing tasks..."
+                ):
+                    found = recover_ids(ids)
+
+                st.success(
+                    f"Found {len(found)} task(s). "
+                    "Open My Videos to download."
+                )
+
+                missing = [
+                    x for x in ids
+                    if x not in found
+                ]
+
+                if missing:
+                    st.warning(
+                        f"{len(missing)} task ID(s) "
+                        "were not returned by Kling."
+                    )
+
+            except Exception as exc:
+                st.error(str(exc))
+
+    st.divider()
+
+    st.write(
+        "Backup the task IDs "
+        "the app currently knows about:"
+    )
+
+    records = all_videos()
+
+    if records:
+        st.download_button(
+            "⬇️ Download Task Backup",
+            data=json.dumps(
+                records,
+                indent=2,
+            ),
+            file_name="kling_task_backup.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+    else:
+        st.caption(
+            "No saved task IDs "
+            "to back up yet."
+        )
+
+    backup = st.file_uploader(
+        "Optional: Restore an older "
+        "task backup",
+        type=["json"],
+    )
+
+    if (
+        backup is not None
+        and st.button("Restore Backup")
+    ):
+        try:
+            data = json.loads(
+                backup.getvalue().decode(
+                    "utf-8"
+                )
+            )
+
+            if isinstance(data, dict):
+                data = data.get(
+                    "videos",
+                    [],
+                )
+
+            if not isinstance(data, list):
+                raise ValueError(
+                    "Backup must contain "
+                    "a list of video records."
+                )
+
+            count = 0
+
+            for item in data:
+                if not isinstance(
+                    item,
+                    dict,
+                ):
+                    continue
+
+                task_id = str(
+                    item.get("task_id")
+                    or item.get("id")
+                    or ""
+                )
+
+                if task_id:
+                    save_video(
+                        task_id,
+                        prompt=str(
+                            item.get("prompt")
+                            or ""
+                        ),
+                        status=str(
+                            item.get("status")
+                            or "submitted"
+                        ),
+                        video_url=str(
+                            item.get("video_url")
+                            or ""
+                        ),
+                    )
+
+                    count += 1
+
+            st.success(
+                f"Restored {count} "
+                "task record(s). "
+                "Open My Videos."
+            )
+
+        except Exception as exc:
+            st.error(
+                "Invalid backup: "
+                + str(exc)
+            )
+
+
+# ====================================
+# FOOTER
+# ====================================
 
 st.divider()
 
 st.caption(
-    "Kling AI Movie Studio — "
-    "Original one-key API connection."
-)
-
-st.caption(
-    "Video task IDs are stored locally "
-    "on the Streamlit server. Closing "
-    "your browser normally does not "
-    "erase them, but server restarts "
-    "or redeployments can. Download "
-    "completed MP4 files promptly."
+    "History is stored in temporary "
+    "Streamlit Cloud SQLite storage. "
+    "A server restart or redeployment "
+    "can erase it. "
+    "Download your MP4 files and "
+    "task backup promptly."
 )
