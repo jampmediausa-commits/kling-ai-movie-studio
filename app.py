@@ -1,7 +1,5 @@
 
 import base64
-import json
-import re
 import time
 from urllib.parse import quote
 
@@ -15,15 +13,9 @@ st.set_page_config(
     layout="centered",
 )
 
-# KEEP THE ORIGINAL WORKING KLING CONNECTION.
-# No new keys or credentials are needed.
+# ORIGINAL KLING API CONFIGURATION — UNCHANGED
 BASE = "https://api-singapore.klingai.com"
 MODEL_PATH = "/omni-video/kling-4.0"
-
-FINAL_STATUSES = {
-    "succeeded", "success", "completed",
-    "failed", "canceled", "cancelled",
-}
 
 
 def secret(name):
@@ -37,9 +29,7 @@ def kling_request(method, path, payload=None):
     key = secret("KLING_API_KEY")
 
     if not key:
-        raise RuntimeError(
-            "KLING_API_KEY is missing from Streamlit Secrets."
-        )
+        raise RuntimeError("KLING_API_KEY is missing.")
 
     try:
         response = requests.request(
@@ -52,9 +42,8 @@ def kling_request(method, path, payload=None):
             json=payload,
             timeout=45,
         )
-
         response.raise_for_status()
-        body = response.json()
+        result = response.json()
 
     except requests.RequestException as exc:
         detail = (
@@ -62,30 +51,21 @@ def kling_request(method, path, payload=None):
             if exc.response is not None
             else str(exc)
         )
-        raise RuntimeError(
-            f"Kling request failed: {detail}"
-        ) from exc
+        raise RuntimeError(detail) from exc
 
-    except ValueError as exc:
-        raise RuntimeError(
-            "Kling returned an invalid JSON response."
-        ) from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("Invalid Kling response.")
 
-    if not isinstance(body, dict):
-        raise RuntimeError(
-            "Unexpected Kling API response."
-        )
-
-    if str(body.get("code", 0)) not in ("0", "200"):
+    if str(result.get("code", 0)) not in ("0", "200"):
         raise RuntimeError(
             str(
-                body.get("message")
-                or body.get("msg")
-                or body
+                result.get("message")
+                or result.get("msg")
+                or result
             )
         )
 
-    return body.get("data")
+    return result.get("data")
 
 
 def parse_tasks(data):
@@ -93,22 +73,13 @@ def parse_tasks(data):
         return data
 
     if isinstance(data, dict):
-        for key in (
-            "tasks",
-            "items",
-            "list",
-            "records",
-        ):
-            value = data.get(key)
-
-            if isinstance(value, list):
-                return value
+        for key in ("tasks", "items", "list", "records"):
+            if isinstance(data.get(key), list):
+                return data[key]
 
         for key in ("data", "result"):
-            value = data.get(key)
-
-            if isinstance(value, (list, dict)):
-                return parse_tasks(value)
+            if isinstance(data.get(key), (dict, list)):
+                return parse_tasks(data[key])
 
         if data.get("id") or data.get("task_id"):
             return [data]
@@ -116,15 +87,7 @@ def parse_tasks(data):
     return []
 
 
-def task_id_of(task):
-    return str(
-        task.get("id")
-        or task.get("task_id")
-        or ""
-    ).strip()
-
-
-def video_from_task(task):
+def get_video_url(task):
     outputs = task.get("outputs") or []
 
     if isinstance(outputs, dict):
@@ -144,177 +107,182 @@ def video_from_task(task):
                 or output.get("video_url")
             )
 
-            if url and (
-                output.get("type") in (None, "video")
-            ):
+            if url and output.get("type") in (None, "video"):
                 return str(url)
 
-    for key in ("video_url", "videoUrl"):
-        if task.get(key):
-            return str(task[key])
-
-    return ""
-
-
-def normalize_status(status):
-    status = str(status or "submitted").lower()
-
-    if status in ("success", "completed"):
-        return "succeeded"
-
-    return status
+    return str(
+        task.get("video_url")
+        or task.get("videoUrl")
+        or ""
+    )
 
 
-def make_video(task_id, task=None):
-    task = task or {}
-
-    return {
-        "task_id": str(task_id),
-        "status": normalize_status(
-            task.get("status")
-        ),
-        "video_url": video_from_task(task),
-        "error": "",
-        "prompt": str(
-            task.get("prompt") or ""
-        ),
-        "created": time.strftime(
-            "%Y-%m-%d %H:%M"
-        ),
-    }
+def get_task_id(task):
+    return str(
+        task.get("id")
+        or task.get("task_id")
+        or ""
+    ).strip()
 
 
-def add_or_update_tasks(tasks):
+def save_tasks(tasks):
     added = 0
-    updated = 0
 
     existing = {
-        item["task_id"]: item
-        for item in st.session_state.videos
+        v["task_id"]: v
+        for v in st.session_state.videos
     }
 
     for task in tasks:
         if not isinstance(task, dict):
             continue
 
-        task_id = task_id_of(task)
+        task_id = get_task_id(task)
 
         if not task_id:
             continue
 
+        status = str(
+            task.get("status") or "submitted"
+        ).lower()
+
+        if status in ("completed", "success"):
+            status = "succeeded"
+
+        url = get_video_url(task)
+
         if task_id in existing:
             video = existing[task_id]
-
-            if task.get("status"):
-                video["status"] = normalize_status(
-                    task["status"]
-                )
-
-            url = video_from_task(task)
+            video["status"] = status
 
             if url:
                 video["video_url"] = url
 
-            if task.get("prompt"):
-                video["prompt"] = str(
-                    task["prompt"]
-                )
-
-            updated += 1
-
         else:
-            video = make_video(task_id, task)
+            video = {
+                "task_id": task_id,
+                "status": status,
+                "video_url": url,
+                "prompt": str(task.get("prompt") or ""),
+                "created": time.strftime("%Y-%m-%d %H:%M"),
+            }
+
             st.session_state.videos.append(video)
             existing[task_id] = video
             added += 1
 
-    return added, updated
-
-
-def lookup_tasks(task_ids):
-    results = []
-
-    for start in range(0, len(task_ids), 20):
-        group = task_ids[start:start + 20]
-
-        path = (
-            "/tasks?task_ids="
-            + quote(",".join(group), safe=",")
-        )
-
-        data = kling_request("GET", path)
-        results.extend(parse_tasks(data))
-
-    return results
+    return added
 
 
 def refresh_videos():
     pending = [
-        item["task_id"]
-        for item in st.session_state.videos
-        if item["status"] not in FINAL_STATUSES
+        v["task_id"]
+        for v in st.session_state.videos
+        if v["status"] not in (
+            "succeeded", "failed", "canceled", "cancelled"
+        )
         or (
-            item["status"] == "succeeded"
-            and not item["video_url"]
+            v["status"] == "succeeded"
+            and not v["video_url"]
         )
     ]
 
-    if not pending:
-        return 0
+    for start in range(0, len(pending), 20):
+        ids = pending[start:start + 20]
 
-    tasks = lookup_tasks(pending)
-    add_or_update_tasks(tasks)
-
-    return len(tasks)
-
-
-def extract_task_ids(value):
-    found = set()
-
-    def walk(item):
-        if isinstance(item, dict):
-            for key, child in item.items():
-                if key in ("task_id", "taskId"):
-                    if isinstance(child, (str, int)):
-                        found.add(str(child).strip())
-
-                elif key == "id":
-                    if (
-                        isinstance(child, str)
-                        and len(child) >= 8
-                    ):
-                        found.add(child.strip())
-
-                elif isinstance(child, (dict, list)):
-                    walk(child)
-
-        elif isinstance(item, list):
-            for child in item:
-                walk(child)
-
-    walk(value)
-
-    return sorted(x for x in found if x)
-
-
-def extract_manual_ids(text):
-    return list(dict.fromkeys(
-        value.strip()
-        for value in re.split(
-            r"[\s,;]+",
-            text or "",
+        path = (
+            "/tasks?task_ids="
+            + quote(",".join(ids), safe=",")
         )
-        if value.strip()
-    ))
+
+        data = kling_request("GET", path)
+        save_tasks(parse_tasks(data))
 
 
-def fetch_video_bytes(url):
+def find_all_kling_videos():
+    """
+    Read-only search using the existing Kling /tasks endpoint.
+
+    Pagination is attempted only when the API response
+    explicitly supplies a next-page cursor or next page.
+    An API that does not expose history cannot be bypassed.
+    """
+    all_tasks = []
+    seen_ids = set()
+    seen_cursors = set()
+
+    path = "/tasks"
+
+    for _ in range(100):
+        data = kling_request("GET", path)
+        tasks = parse_tasks(data)
+
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+
+            task_id = get_task_id(task)
+
+            if task_id and task_id not in seen_ids:
+                seen_ids.add(task_id)
+                all_tasks.append(task)
+
+        if not isinstance(data, dict):
+            break
+
+        next_cursor = (
+            data.get("next_cursor")
+            or data.get("nextCursor")
+        )
+
+        if not next_cursor:
+            pagination = data.get("pagination")
+
+            if isinstance(pagination, dict):
+                next_cursor = (
+                    pagination.get("next_cursor")
+                    or pagination.get("nextCursor")
+                )
+
+        if next_cursor:
+            next_cursor = str(next_cursor)
+
+            if next_cursor in seen_cursors:
+                break
+
+            seen_cursors.add(next_cursor)
+
+            path = (
+                "/tasks?cursor="
+                + quote(next_cursor, safe="")
+            )
+            continue
+
+        next_page = data.get("next_page")
+
+        if next_page is None:
+            next_page = data.get("nextPage")
+
+        if next_page is not None:
+            try:
+                page = int(next_page)
+            except (TypeError, ValueError):
+                break
+
+            path = f"/tasks?page={page}"
+            continue
+
+        break
+
+    return all_tasks
+
+
+def download_video(url):
     response = requests.get(
         url,
-        timeout=120,
         stream=True,
+        timeout=120,
     )
-
     response.raise_for_status()
 
     chunks = []
@@ -331,8 +299,8 @@ def fetch_video_bytes(url):
 
         if total > maximum:
             raise RuntimeError(
-                "Video is larger than 250 MB. "
-                "Use Save to Photos / Open Video instead."
+                "Video exceeds 250 MB. "
+                "Use Open Video instead."
             )
 
         chunks.append(chunk)
@@ -340,25 +308,18 @@ def fetch_video_bytes(url):
     return b"".join(chunks)
 
 
-def render_video(video, index, prefix):
+def display_video(video, index, section):
     task_id = video["task_id"]
-    url = video.get("video_url", "")
-    status = video.get("status", "unknown")
+    status = video["status"]
+    url = video["video_url"]
 
     with st.container(border=True):
         st.markdown(f"### Video {index}")
 
-        st.caption(
-            f"Task ID: {task_id}"
-        )
+        st.caption(f"Status: {status}")
 
         if video.get("prompt"):
-            st.write(video["prompt"][:250])
-
-        st.write(f"Status: **{status}**")
-
-        if video.get("error"):
-            st.error(video["error"])
+            st.write(video["prompt"][:200])
 
         if url:
             st.video(url)
@@ -370,77 +331,59 @@ def render_video(video, index, prefix):
             )
 
             st.caption(
-                "On iPhone, open the video, "
-                "tap Share, then Save Video. "
-                "If it saves to Files, open "
-                "the MP4 there and choose "
-                "Share → Save Video."
+                "On iPhone, open the video and "
+                "use Share → Save Video. "
+                "If it opens in Files, share "
+                "the MP4 from Files to Photos."
             )
 
-            key = f"{prefix}_{task_id}"
+            key = f"{section}_{task_id}"
 
             if st.button(
-                "⬇️ Prepare MP4 Download",
+                "⬇️ Prepare MP4",
                 key=f"prepare_{key}",
                 use_container_width=True,
             ):
                 try:
-                    with st.spinner(
-                        "Preparing your video..."
-                    ):
+                    with st.spinner("Preparing MP4..."):
                         st.session_state[
-                            f"download_{key}"
-                        ] = fetch_video_bytes(url)
+                            f"mp4_{key}"
+                        ] = download_video(url)
 
                 except Exception as exc:
                     st.error(str(exc))
 
-            data = st.session_state.get(
-                f"download_{key}"
+            video_bytes = st.session_state.get(
+                f"mp4_{key}"
             )
 
-            if data:
+            if video_bytes:
                 st.download_button(
                     "⬇️ Download MP4",
-                    data=data,
-                    file_name=(
-                        f"kling_{task_id}.mp4"
-                    ),
+                    data=video_bytes,
+                    file_name=f"kling_{task_id}.mp4",
                     mime="video/mp4",
-                    key=f"download_button_{key}",
+                    key=f"download_{key}",
                     use_container_width=True,
                 )
 
         elif status == "succeeded":
             st.warning(
-                "Kling reports this video as "
-                "completed, but no video URL "
-                "was returned."
+                "Kling reports completion but "
+                "did not return a video URL."
             )
 
-        elif status in (
-            "failed",
-            "canceled",
-            "cancelled",
-        ):
-            st.warning(
-                "This task did not complete."
-            )
+        elif status in ("failed", "canceled", "cancelled"):
+            st.warning("This video task did not complete.")
 
         else:
-            st.info(
-                "Video is processing. "
-                "Use Refresh Status to check."
-            )
+            st.info("Video is still processing.")
 
 
-# PASSWORD LOGIN
-# Uses the same APP_PASSWORD secret.
+# LOGIN — ORIGINAL APP_PASSWORD
 password = secret("APP_PASSWORD")
 
-if password and not st.session_state.get(
-    "unlocked", False
-):
+if password and not st.session_state.get("unlocked", False):
     st.title("🔒 Kling AI Movie Studio")
 
     with st.form("login"):
@@ -467,80 +410,58 @@ if password and not st.session_state.get(
 if "videos" not in st.session_state:
     st.session_state.videos = []
 
-if "recovered_ids" not in st.session_state:
-    st.session_state.recovered_ids = []
+if "history_ids" not in st.session_state:
+    st.session_state.history_ids = []
 
-if "recovery_message" not in st.session_state:
-    st.session_state.recovery_message = ""
+if "history_searched" not in st.session_state:
+    st.session_state.history_searched = False
 
 
 st.title("🎬 Kling AI Movie Studio")
 
-st.caption(
-    "Generate, recover, watch, and "
-    "download your Kling videos."
-)
-
 if not secret("KLING_API_KEY"):
-    st.error(
-        "Your existing KLING_API_KEY "
-        "was not found in Streamlit Secrets."
-    )
+    st.error("KLING_API_KEY is missing.")
     st.stop()
 
 
-generate_tab, videos_tab, recover_tab = st.tabs([
+generate_tab, videos_tab, history_tab = st.tabs([
     "🎬 Generate",
     "📹 Videos",
-    "♻️ Recover",
+    "📚 Kling History",
 ])
 
 
-# -----------------------------------------
-# TAB 1: GENERATE
-# -----------------------------------------
+# ====================================
+# TAB 1 — GENERATE
+# ====================================
 
 with generate_tab:
     st.subheader("Generate Video")
 
-    with st.form(
-        "generate_form",
-        clear_on_submit=False,
-    ):
+    with st.form("generate_form"):
         uploaded = st.file_uploader(
-            "Upload image",
-            type=[
-                "png",
-                "jpg",
-                "jpeg",
-                "webp",
-            ],
+            "Upload Image",
+            type=["png", "jpg", "jpeg", "webp"],
         )
 
         prompt = st.text_area(
-            "Video prompt",
+            "Video Prompt",
             height=150,
-            placeholder=(
-                "Describe what happens "
-                "in your video..."
-            ),
+            placeholder="Describe the video...",
         )
 
         duration = st.selectbox(
             "Duration",
             [5, 10],
-            index=0,
         )
 
         aspect = st.selectbox(
-            "Aspect ratio",
+            "Aspect Ratio",
             ["9:16", "16:9", "1:1"],
-            index=0,
         )
 
         st.caption(
-            "Generate creates a paid Kling task. "
-            "Each submission may use credits."
+            "Generate submits a paid Kling task."
         )
 
         submitted = st.form_submit_button(
@@ -552,7 +473,6 @@ with generate_tab:
     if uploaded:
         st.image(
             uploaded.getvalue(),
-            caption="Uploaded image",
             use_container_width=True,
         )
 
@@ -564,15 +484,10 @@ with generate_tab:
             st.error("Enter a prompt first.")
 
         elif uploaded.size > 30 * 1024 * 1024:
-            st.error(
-                "Image exceeds 30 MB."
-            )
+            st.error("Image exceeds 30 MB.")
 
         else:
-            mime = (
-                uploaded.type
-                or "image/png"
-            )
+            mime = uploaded.type or "image/png"
 
             encoded = base64.b64encode(
                 uploaded.getvalue()
@@ -582,7 +497,7 @@ with generate_tab:
                 f"data:{mime};base64,{encoded}"
             )
 
-            # ORIGINAL KLING 4.0 PAYLOAD
+            # ORIGINAL GENERATION PAYLOAD
             payload = {
                 "contents": [
                     {
@@ -603,9 +518,7 @@ with generate_tab:
             }
 
             try:
-                with st.spinner(
-                    "Submitting video to Kling..."
-                ):
+                with st.spinner("Submitting to Kling..."):
                     data = kling_request(
                         "POST",
                         MODEL_PATH,
@@ -614,19 +527,17 @@ with generate_tab:
 
                 if not isinstance(data, dict):
                     raise RuntimeError(
-                        "Kling did not return "
-                        "a valid task."
+                        "Kling did not return a valid task."
                     )
 
-                task_id = task_id_of(data)
+                task_id = get_task_id(data)
 
                 if not task_id:
                     raise RuntimeError(
-                        "Kling did not return "
-                        "a task ID."
+                        "Kling did not return a task ID."
                     )
 
-                add_or_update_tasks([{
+                save_tasks([{
                     **data,
                     "id": task_id,
                     "prompt": prompt.strip(),
@@ -637,358 +548,146 @@ with generate_tab:
                     "Open the Videos tab."
                 )
 
-                st.code(task_id)
-
             except Exception as exc:
                 st.error(str(exc))
 
 
-# -----------------------------------------
-# TAB 2: CURRENT VIDEOS
-# -----------------------------------------
+# ====================================
+# TAB 2 — VIDEOS
+# ====================================
 
 with videos_tab:
-    st.subheader("Your Videos")
+    st.subheader("My Videos")
 
     if st.button(
-        "🔄 Refresh Video Status",
-        key="refresh_current",
+        "🔄 Refresh Videos",
         use_container_width=True,
     ):
         try:
-            with st.spinner(
-                "Checking Kling..."
-            ):
-                count = refresh_videos()
+            with st.spinner("Checking Kling..."):
+                refresh_videos()
 
-            st.success(
-                f"Checked {count} task(s)."
-            )
+            st.success("Video statuses refreshed.")
 
         except Exception as exc:
             st.error(str(exc))
 
     if not st.session_state.videos:
-        st.info(
-            "Videos generated or recovered "
-            "during this session will "
-            "appear here."
-        )
+        st.info("Your videos will appear here.")
 
     for index, video in enumerate(
         st.session_state.videos,
         1,
     ):
-        render_video(
-            video,
-            index,
-            "current",
-        )
+        display_video(video, index, "videos")
 
 
-# -----------------------------------------
-# TAB 3: RECOVER KLING VIDEOS
-# -----------------------------------------
+# ====================================
+# TAB 3 — KLING HISTORY
+# ONE SEARCH BUTTON
+# ====================================
 
-with recover_tab:
-    st.subheader(
-        "Recover Videos From Kling"
-    )
+with history_tab:
+    st.subheader("My Kling Video History")
 
     st.write(
-        "Retrieve older videos using "
-        "your existing Kling API key. "
-        "Recovery does not generate "
-        "new videos."
-    )
-
-    st.markdown(
-        "#### 1. Find Available Kling Tasks"
-    )
-
-    st.caption(
-        "This attempts to list existing "
-        "tasks from the original Kling "
-        "API server. Some accounts or "
-        "API versions may not support "
-        "listing complete history."
+        "Search the Kling API for your "
+        "previously generated videos."
     )
 
     if st.button(
-        "🔍 Find My Kling Videos",
+        "🔍 Find All My Kling Videos",
         type="primary",
-        key="find_history",
         use_container_width=True,
     ):
         try:
             with st.spinner(
-                "Checking Kling task history..."
+                "Searching Kling video history..."
             ):
-                data = kling_request(
-                    "GET",
-                    "/tasks",
-                )
+                tasks = find_all_kling_videos()
 
-                tasks = parse_tasks(data)
+                save_tasks(tasks)
 
-                added, updated = (
-                    add_or_update_tasks(tasks)
-                )
-
-                ids = [
-                    task_id_of(task)
-                    for task in tasks
-                    if isinstance(task, dict)
-                ]
-
-                st.session_state.recovered_ids = (
+                st.session_state.history_ids = (
                     list(dict.fromkeys(
-                        st.session_state.recovered_ids
-                        + [x for x in ids if x]
+                        get_task_id(task)
+                        for task in tasks
+                        if get_task_id(task)
                     ))
                 )
 
+                st.session_state.history_searched = True
+
             if tasks:
                 st.success(
-                    f"Found {len(tasks)} tasks. "
-                    f"Added {added} new videos."
+                    f"Found {len(tasks)} Kling tasks."
                 )
             else:
                 st.warning(
-                    "Kling did not return "
-                    "a task list. Try recovering "
-                    "by task ID or project JSON "
-                    "below."
+                    "Kling returned no historical tasks. "
+                    "This API may not expose your "
+                    "account's full video history."
                 )
 
         except Exception as exc:
-            st.warning(
-                "Kling's task-history listing "
-                "was unavailable."
+            st.error(
+                "Kling could not provide video history "
+                "through this API endpoint."
             )
             st.caption(str(exc))
 
-    st.divider()
-
-    st.markdown(
-        "#### 2. Recover by Task ID"
+    history_ids = set(
+        st.session_state.history_ids
     )
 
-    manual_ids = st.text_area(
-        "Paste Kling task IDs",
-        placeholder=(
-            "Paste one or more task IDs. "
-            "Separate with commas or "
-            "new lines."
-        ),
-        height=110,
-    )
-
-    if st.button(
-        "🔎 Recover These Videos",
-        key="recover_manual",
-        use_container_width=True,
-    ):
-        ids = extract_manual_ids(
-            manual_ids
-        )
-
-        if not ids:
-            st.error(
-                "Enter at least one task ID."
-            )
-
-        else:
-            try:
-                with st.spinner(
-                    "Retrieving videos..."
-                ):
-                    tasks = lookup_tasks(ids)
-
-                    added, updated = (
-                        add_or_update_tasks(tasks)
-                    )
-
-                    st.session_state.recovered_ids = (
-                        list(dict.fromkeys(
-                            st.session_state.recovered_ids
-                            + ids
-                        ))
-                    )
-
-                st.success(
-                    f"Found {len(tasks)} tasks. "
-                    f"Added {added} new videos."
-                )
-
-                if len(tasks) < len(ids):
-                    st.warning(
-                        "Some task IDs were not "
-                        "returned by Kling."
-                    )
-
-            except Exception as exc:
-                st.error(str(exc))
-
-    st.divider()
-
-    st.markdown(
-        "#### 3. Import Old Project JSON"
-    )
-
-    project_file = st.file_uploader(
-        "Upload an older project JSON file",
-        type=["json"],
-        key="project_import",
-    )
-
-    if project_file is not None:
-        if st.button(
-            "📂 Recover From Project",
-            key="recover_json",
-            use_container_width=True,
-        ):
-            try:
-                project = json.loads(
-                    project_file.getvalue()
-                    .decode("utf-8")
-                )
-
-                ids = extract_task_ids(
-                    project
-                )
-
-                if not ids:
-                    st.warning(
-                        "No task IDs were found "
-                        "in this project file."
-                    )
-
-                else:
-                    with st.spinner(
-                        "Checking saved tasks..."
-                    ):
-                        tasks = lookup_tasks(ids)
-
-                        added, updated = (
-                            add_or_update_tasks(tasks)
-                        )
-
-                        st.session_state.recovered_ids = (
-                            list(dict.fromkeys(
-                                st.session_state.recovered_ids
-                                + ids
-                            ))
-                        )
-
-                    st.success(
-                        f"Found {len(tasks)} tasks "
-                        f"from {len(ids)} IDs. "
-                        f"Added {added} new videos."
-                    )
-
-            except Exception as exc:
-                st.error(
-                    f"Could not import project: {exc}"
-                )
-
-    st.divider()
-
-    st.markdown(
-        "#### 4. Recovered Videos"
-    )
-
-    recovered = [
+    history_videos = [
         video
         for video in st.session_state.videos
-        if video["task_id"]
-        in st.session_state.recovered_ids
+        if video["task_id"] in history_ids
     ]
 
-    if st.button(
-        "🔄 Refresh Recovered Videos",
-        key="refresh_recovered",
-        use_container_width=True,
-    ):
-        try:
-            with st.spinner(
-                "Refreshing..."
-            ):
-                refresh_videos()
+    completed = [
+        video
+        for video in history_videos
+        if video.get("video_url")
+    ]
 
-            st.success(
-                "Video status refreshed."
+    if completed:
+        st.markdown(
+            f"### Available Videos ({len(completed)})"
+        )
+
+        for index, video in enumerate(
+            completed,
+            1,
+        ):
+            display_video(
+                video,
+                index,
+                "history",
             )
 
-        except Exception as exc:
-            st.error(str(exc))
-
-    if not recovered:
+    elif st.session_state.history_searched:
         st.info(
-            "Recovered videos will "
-            "appear here."
+            "No downloadable videos were returned "
+            "by Kling's history endpoint."
         )
 
-    for index, video in enumerate(
-        recovered,
-        1,
-    ):
-        render_video(
-            video,
-            index,
-            "recovered",
-        )
-
-    st.divider()
-
-    st.markdown(
-        "#### Save Your Task IDs"
-    )
-
-    all_ids = list(dict.fromkeys(
-        video["task_id"]
-        for video in st.session_state.videos
-    ))
-
-    if all_ids:
-        backup = {
-            "task_ids": all_ids,
-            "videos": st.session_state.videos,
-        }
-
-        st.download_button(
-            "💾 Download Recovery Backup",
-            data=json.dumps(
-                backup,
-                indent=2,
-            ),
-            file_name=(
-                "kling_video_recovery.json"
-            ),
-            mime="application/json",
-            use_container_width=True,
-        )
-
-        st.caption(
-            "Keep this backup. It contains "
-            "your task IDs so you can "
-            "recover them after the "
-            "Streamlit session resets."
+    else:
+        st.info(
+            "Press the button above to search."
         )
 
 
 st.divider()
 
 st.caption(
-    "Kling AI Movie Studio | "
-    "Original one-key Kling API connection"
+    "Kling AI Movie Studio — "
+    "Original KLING_API_KEY connection."
 )
 
 st.caption(
-    "Important: Kling video links may expire. "
-    "Download completed videos promptly. "
-    "This app keeps its working list in "
-    "the current Streamlit session; "
-    "use the recovery backup to preserve "
-    "task IDs."
+    "Video history availability depends on "
+    "what Kling's API returns. Video URLs "
+    "may expire, so save completed videos."
 )
